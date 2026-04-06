@@ -1,0 +1,10 @@
+{
+  "name": "claude-stream-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.19.0",
+    "ws": "^8.13.0"
+  }
+}
