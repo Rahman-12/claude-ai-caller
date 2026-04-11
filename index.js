@@ -1,9 +1,12 @@
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 import Anthropic from "@anthropic-ai/sdk";
 
 const PORT = process.env.PORT || 8080;
 
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({
+  port: PORT,
+  host: "0.0.0.0"
+});
 
 console.log("Claude AI Caller WebSocket server running on port", PORT);
 
@@ -16,7 +19,8 @@ wss.on("connection", async (twilioWs, req) => {
     apiKey: process.env.ANTHROPIC_API_KEY
   });
 
-  const claudeWs = anthropic.messages.stream({
+  // Start Claude streaming session
+  const claudeStream = await anthropic.messages.stream({
     model: "claude-3-sonnet",
     max_tokens: 4096,
     audio: {
@@ -31,22 +35,45 @@ wss.on("connection", async (twilioWs, req) => {
     ]
   });
 
-  // Forward audio from Twilio → Claude
-  twilioWs.on("message", msg => {
-    claudeWs.send(msg);
+  // Claude sends events (including audio chunks)
+  claudeStream.on("text", (text) => {
+    console.log("Claude text:", text);
   });
 
-  // Forward audio from Claude → Twilio
-  claudeWs.on("message", msg => {
+  claudeStream.on("message", (msg) => {
+    // Forward Claude audio to Twilio
     twilioWs.send(msg);
+  });
+
+  claudeStream.on("error", (err) => {
+    console.error("Claude stream error:", err);
+  });
+
+  claudeStream.on("end", () => {
+    console.log("Claude stream ended");
+  });
+
+  // Forward Twilio audio → Claude
+  twilioWs.on("message", (msg) => {
+    claudeStream.send(msg);
   });
 
   twilioWs.on("close", () => {
     console.log("Twilio disconnected");
-    claudeWs.close();
-  });
-
-  claudeWs.on("close", () => {
-    console.log("Claude stream closed");
+    claudeStream.close();
   });
 });
+
+// Keep container alive
+setInterval(() => {
+  console.log("Server alive");
+}, 30000);
+
+// Error logging
+wss.on("error", (err) => {
+  console.error("WebSocket Server Error:", err);
+});
+
+process.on("uncaughtException", console.error);
+process.on("unhandledRejection", console.error);
+
