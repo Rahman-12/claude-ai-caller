@@ -13,7 +13,8 @@ console.log("Claude AI Caller WebSocket server running on port", PORT);
 wss.on("connection", async (twilioWs, req) => {
   console.log("Twilio connected to stream");
 
-  const leadName = req.headers["x-twilio-stream-parameter-leadname"] || "Customer";
+  const leadName =
+    req.headers["x-twilio-stream-parameter-leadname"] || "Customer";
 
   const anthropic = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY
@@ -35,14 +36,16 @@ wss.on("connection", async (twilioWs, req) => {
     ]
   });
 
-  // Claude sends events (including audio chunks)
-  claudeStream.on("text", (text) => {
-    console.log("Claude text:", text);
+  // Claude sends structured events
+  claudeStream.on("content_block_delta", (delta) => {
+    if (delta.delta?.audio) {
+      // Forward Claude audio → Twilio
+      twilioWs.send(delta.delta.audio);
+    }
   });
 
-  claudeStream.on("message", (msg) => {
-    // Forward Claude audio to Twilio
-    twilioWs.send(msg);
+  claudeStream.on("text", (text) => {
+    console.log("Claude text:", text);
   });
 
   claudeStream.on("error", (err) => {
@@ -53,9 +56,13 @@ wss.on("connection", async (twilioWs, req) => {
     console.log("Claude stream ended");
   });
 
-  // Forward Twilio audio → Claude
+  // Twilio audio → Claude
   twilioWs.on("message", (msg) => {
-    claudeStream.send(msg);
+    try {
+      claudeStream.sendAudio(msg);
+    } catch (err) {
+      console.error("Error sending audio to Claude:", err);
+    }
   });
 
   twilioWs.on("close", () => {
@@ -76,4 +83,3 @@ wss.on("error", (err) => {
 
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
-
