@@ -1,85 +1,209 @@
 import { WebSocketServer } from "ws";
+import { createServer } from "http";
 import Anthropic from "@anthropic-ai/sdk";
 
 const PORT = process.env.PORT || 8080;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const wss = new WebSocketServer({
-  port: PORT,
-  host: "0.0.0.0"
+// Store active call sessions keyed by callSid
+const sessions = new Map();
+
+// Create a plain HTTP server so we can route WebSocket paths
+const server = createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Claude AI Caller running");
 });
 
-console.log("Claude AI Caller WebSocket server running on port", PORT);
+const wss = new WebSocketServer({ server });
 
-wss.on("connection", async (twilioWs, req) => {
-  console.log("Twilio connected to stream");
+wss.on("connection", (ws, req) => {
+  const url = req.url;
 
-  const leadName =
-    req.headers["x-twilio-stream-parameter-leadname"] || "Customer";
+  if (url === "/stream" || url === "/") {
+    handleTwilioStream(ws);
+  } else if (url === "/transcription") {
+    handleTranscription(ws);
+  } else {
+    ws.close();
+  }
+});
 
-  const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY
+// ─── Handle Twilio Media Stream ───────────────────────────────────────────────
+
+function handleTwilioStream(ws) {
+  console.log("Twilio media stream connected");
+
+  let leadName = "Customer";
+  let callSid = null;
+  let streamSid = null;
+  const conversationHistory = [];
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    switch (msg.event) {
+      case "start":
+        streamSid = msg.start.streamSid;
+        callSid = msg.start.callSid;
+        leadName = msg.start.customParameters?.leadName || "Customer";
+        console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}`);
+
+        // Store session so transcription handler can find it
+        sessions.set(callSid, { ws, streamSid, conversationHistory, leadName });
+
+        // Send opening greeting
+        await sendClaudeResponse({
+          ws,
+          streamSid,
+          conversationHistory,
+          leadName,
+          userMessage: null // triggers greeting
+        });
+        break;
+
+      case "stop":
+        console.log(`Stream stopped — Call: ${callSid}`);
+        sessions.delete(callSid);
+        break;
+
+      case "media":
+        // Raw audio — handled via transcription websocket instead
+        break;
+    }
   });
 
-  // Start Claude streaming session
-  const claudeStream = await anthropic.messages.stream({
-    model: "claude-3-sonnet",
-    max_tokens: 4096,
-    audio: {
-      input: [{ type: "input_audio_buffer" }],
-      output: { format: "wav" }
-    },
-    messages: [
+  ws.on("close", () => {
+    console.log("Stream WS closed");
+    if (callSid) sessions.delete(callSid);
+  });
+
+  ws.on("error", (err) => console.error("Stream WS error:", err));
+}
+
+// ─── Handle Twilio Transcription ─────────────────────────────────────────────
+
+function handleTranscription(ws) {
+  console.log("Transcription WS connected");
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // Only process final transcripts
+    if (msg.TranscriptionEvent !== "transcription-content") return;
+    if (msg.Final !== "true") return;
+
+    const transcript = msg.TranscriptionData?.transcript;
+    const callSid = msg.CallSid;
+
+    if (!transcript || !callSid) return;
+
+    console.log(`[${callSid}] Customer said: "${transcript}"`);
+
+    const session = sessions.get(callSid);
+    if (!session) {
+      console.warn(`No session found for CallSid: ${callSid}`);
+      return;
+    }
+
+    const { ws: streamWs, streamSid, conversationHistory, leadName } = session;
+
+    await sendClaudeResponse({
+      ws: streamWs,
+      streamSid,
+      conversationHistory,
+      leadName,
+      userMessage: transcript
+    });
+  });
+
+  ws.on("close", () => console.log("Transcription WS closed"));
+  ws.on("error", (err) => console.error("Transcription WS error:", err));
+}
+
+// ─── Claude + TTS ─────────────────────────────────────────────────────────────
+
+async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage }) {
+  try {
+    if (userMessage) {
+      conversationHistory.push({ role: "user", content: userMessage });
+    }
+
+    const messages = conversationHistory.length > 0
+      ? conversationHistory
+      : [{ role: "user", content: "Begin the conversation." }];
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 200,
+      system: `You are a friendly and helpful inbound customer support agent. 
+The customer's name is ${leadName}. 
+Keep all responses concise and natural for voice — maximum 2-3 sentences. 
+Never use bullet points, markdown, or lists. Speak conversationally.`,
+      messages
+    });
+
+    const replyText = response.content[0].text;
+    console.log(`Claude: "${replyText}"`);
+
+    conversationHistory.push({ role: "assistant", content: replyText });
+
+    await textToSpeechAndStream(ws, streamSid, replyText);
+
+  } catch (err) {
+    console.error("Claude error:", err.message);
+  }
+}
+
+async function textToSpeechAndStream(ws, streamSid, text) {
+  try {
+    const XI_API_KEY = process.env.ELEVENLABS_API_KEY;
+    const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream?output_format=ulaw_8000`,
       {
-        role: "user",
-        content: `You are calling a lead named ${leadName}. Start the conversation politely and naturally.`
+        method: "POST",
+        headers: {
+          "xi-api-key": XI_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_turbo_v2",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        })
       }
-    ]
-  });
+    );
 
-  // Claude sends structured events
-  claudeStream.on("content_block_delta", (delta) => {
-    if (delta.delta?.audio) {
-      // Forward Claude audio → Twilio
-      twilioWs.send(delta.delta.audio);
+    if (!response.ok) {
+      console.error("ElevenLabs error:", await response.text());
+      return;
     }
-  });
 
-  claudeStream.on("text", (text) => {
-    console.log("Claude text:", text);
-  });
+    const audioBuffer = await response.arrayBuffer();
+    const base64Audio = Buffer.from(audioBuffer).toString("base64");
 
-  claudeStream.on("error", (err) => {
-    console.error("Claude stream error:", err);
-  });
-
-  claudeStream.on("end", () => {
-    console.log("Claude stream ended");
-  });
-
-  // Twilio audio → Claude
-  twilioWs.on("message", (msg) => {
-    try {
-      claudeStream.sendAudio(msg);
-    } catch (err) {
-      console.error("Error sending audio to Claude:", err);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: base64Audio }
+      }));
     }
-  });
 
-  twilioWs.on("close", () => {
-    console.log("Twilio disconnected");
-    claudeStream.close();
-  });
+  } catch (err) {
+    console.error("TTS error:", err.message);
+  }
+}
+
+// ─── Start Server ─────────────────────────────────────────────────────────────
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
 
-// Keep container alive
-setInterval(() => {
-  console.log("Server alive");
-}, 30000);
-
-// Error logging
-wss.on("error", (err) => {
-  console.error("WebSocket Server Error:", err);
-});
-
+setInterval(() => console.log("Server alive"), 30000);
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
