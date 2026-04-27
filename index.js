@@ -6,16 +6,56 @@ const PORT = process.env.PORT || 8080;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "ElectraBoostAI";
 const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
-const NOTIFY_EMAIL = "electraboostai@gmail.com";
 const NOTIFY_PHONE = "+447840910698";
 const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 
-// Store active call sessions keyed by callSid
 const sessions = new Map();
 
-// Create HTTP server to route WebSocket paths
-const server = createServer((req, res) => {
+// HTTP server handles both transcription POST callbacks and WebSocket upgrades
+const server = createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/transcription") {
+    let body = "";
+    req.on("data", chunk => body += chunk.toString());
+    req.on("end", async () => {
+      try {
+        const params = new URLSearchParams(body);
+        const transcript = params.get("TranscriptionText") || params.get("TranscriptionData");
+        const callSid = params.get("CallSid");
+        const isFinal = params.get("Final") === "true" || params.get("TranscriptionStatus") === "completed";
+
+        console.log(`Transcription POST received — CallSid: ${callSid}, Final: ${isFinal}, Text: ${transcript}`);
+
+        if (transcript && callSid && isFinal) {
+          const session = sessions.get(callSid);
+          if (session) {
+            const { ws, streamSid, conversationHistory, leadName } = session;
+            console.log(`Customer said: "${transcript}"`);
+            await sendClaudeResponse({
+              ws,
+              streamSid,
+              conversationHistory,
+              leadName,
+              userMessage: transcript,
+              session
+            });
+          } else {
+            console.warn(`No session found for CallSid: ${callSid}`);
+          }
+        }
+
+        res.writeHead(200);
+        res.end("OK");
+      } catch (err) {
+        console.error("Transcription POST error:", err);
+        res.writeHead(500);
+        res.end("Error");
+      }
+    });
+    return;
+  }
+
+  // Default response
   res.writeHead(200);
   res.end(`${BUSINESS_NAME} AI Caller running`);
 });
@@ -26,8 +66,6 @@ wss.on("connection", (ws, req) => {
   const url = req.url;
   if (url === "/stream" || url === "/") {
     handleTwilioStream(ws);
-  } else if (url === "/transcription") {
-    handleTranscription(ws);
   } else {
     ws.close();
   }
