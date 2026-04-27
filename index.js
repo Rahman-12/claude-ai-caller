@@ -20,9 +20,18 @@ const server = createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const params = new URLSearchParams(body);
-        const transcript = params.get("TranscriptionText") || params.get("TranscriptionData");
         const callSid = params.get("CallSid");
         const isFinal = params.get("Final") === "true" || params.get("TranscriptionStatus") === "completed";
+
+        // Parse transcript — Twilio sometimes returns it as a JSON string
+        let rawTranscript = params.get("TranscriptionText") || params.get("TranscriptionData");
+        let transcript = rawTranscript;
+        try {
+          const parsed = JSON.parse(rawTranscript);
+          if (parsed.transcript) transcript = parsed.transcript;
+        } catch {
+          // Not JSON, use as-is
+        }
 
         console.log(`Transcription POST received — CallSid: ${callSid}, Final: ${isFinal}, Text: ${transcript}`);
 
@@ -54,7 +63,6 @@ const server = createServer(async (req, res) => {
     });
     return;
   }
-
   // Default response
   res.writeHead(200);
   res.end(`${BUSINESS_NAME} AI Caller running`);
@@ -189,11 +197,11 @@ async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 200,
-      system: `You are a friendly and professional call handler working for ${BUSINESS_NAME}, a company that connects homeowners and businesses with qualified local electricians.
+      system: `You are a friendly and professional call handler named James, working for ${BUSINESS_NAME}, a company that connects homeowners and businesses with qualified local electricians.
 You are calling ${leadName} because they just filled out a form showing interest in hiring a qualified local electrician.
 
 Your goals in this exact order are:
-1. Greet them warmly by name and confirm you are calling from ${BUSINESS_NAME} about their enquiry for an electrician
+1. Greet them warmly by name, introduce yourself as James from ${BUSINESS_NAME}, and confirm you are calling about their electrician enquiry
 2. Ask what electrical work they need done
 3. Ask for their postcode or general area so you can match them with a local electrician
 4. Ask when they need the work done — urgently, within the week, or just planning ahead
@@ -202,7 +210,7 @@ Your goals in this exact order are:
 Rules you must follow:
 - Keep every response to 1-3 sentences maximum — this is a phone call not a chat
 - Sound natural and human — never robotic or scripted
-- Never mention you are an AI unless directly asked — if asked, say you are a call handler for ${BUSINESS_NAME}
+- Never mention you are an AI unless directly asked — if asked, say you are a call handler named James for ${BUSINESS_NAME}
 - Never make up prices, timelines, or electrician names
 - If they seem uninterested or say wrong number, politely apologise on behalf of ${BUSINESS_NAME} and end the call
 - If they ask a technical electrical question, tell them the electrician will be best placed to advise when they call back
