@@ -63,6 +63,7 @@ const server = createServer(async (req, res) => {
     });
     return;
   }
+
   // Default response
   res.writeHead(200);
   res.end(`${BUSINESS_NAME} AI Caller running`);
@@ -139,49 +140,6 @@ function handleTwilioStream(ws) {
   ws.on("error", (err) => console.error("Stream WS error:", err));
 }
 
-// ─── Handle Twilio Transcription ─────────────────────────────────────────────
-
-function handleTranscription(ws) {
-  console.log("Transcription WS connected");
-
-  ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    console.log("Transcription event received:", JSON.stringify(msg));
-
-    if (msg.TranscriptionEvent !== "transcription-content") return;
-    if (msg.Final !== "true") return;
-
-    const transcript = msg.TranscriptionData?.transcript;
-    const callSid = msg.CallSid;
-
-    if (!transcript || !callSid) return;
-
-    console.log(`[${callSid}] Customer said: "${transcript}"`);
-
-    const session = sessions.get(callSid);
-    if (!session) {
-      console.warn(`No session found for CallSid: ${callSid}`);
-      return;
-    }
-
-    const { ws: streamWs, streamSid, conversationHistory, leadName } = session;
-
-    await sendClaudeResponse({
-      ws: streamWs,
-      streamSid,
-      conversationHistory,
-      leadName,
-      userMessage: transcript,
-      session
-    });
-  });
-
-  ws.on("close", () => console.log("Transcription WS closed"));
-  ws.on("error", (err) => console.error("Transcription WS error:", err));
-}
-
 // ─── Claude + TTS ─────────────────────────────────────────────────────────────
 
 async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage, session }) {
@@ -256,9 +214,8 @@ async function handleCallEnded(session) {
 
   console.log(`Call ended for ${leadName} — Qualified: ${isQualified}`);
 
-  // Build transcript
   const transcript = conversationHistory
-    .map(m => `${m.role === "user" ? leadName : "AI"}: ${m.content}`)
+    .map(m => `${m.role === "user" ? leadName : "James"}: ${m.content}`)
     .join("\n");
 
   if (!isQualified) {
@@ -267,20 +224,15 @@ async function handleCallEnded(session) {
   }
 
   try {
-    // 1. Find the contact in HubSpot by name
     const contactId = await findHubSpotContact(leadName);
 
     if (contactId) {
-      // 2. Log note on contact
       await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
-
-      // 3. Move deal to Contacted stage
       await updateDealStage(contactId, leadName);
     } else {
       console.warn(`No HubSpot contact found for ${leadName}`);
     }
 
-    // 4. Send SMS notification to you
     await sendSMSNotification(leadName, qualifiedData);
 
     console.log("All post-call actions completed successfully");
@@ -330,7 +282,6 @@ async function findHubSpotContact(leadName) {
 
 async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
   try {
-    // Create the note as an engagement
     const noteResponse = await fetch(
       `https://api.hubapi.com/crm/v3/objects/notes`,
       {
@@ -362,7 +313,6 @@ async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
 
 async function updateDealStage(contactId, leadName) {
   try {
-    // First find associated deal
     const dealsResponse = await fetch(
       `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals`,
       {
@@ -379,8 +329,7 @@ async function updateDealStage(contactId, leadName) {
       return;
     }
 
-    // Update existing deal stage
-    const updateResponse = await fetch(
+    await fetch(
       `https://api.hubapi.com/crm/v3/objects/deals/${dealId}`,
       {
         method: "PATCH",
@@ -477,36 +426,47 @@ async function textToSpeechAndStream(ws, streamSid, text) {
     const XI_API_KEY = process.env.ELEVENLABS_API_KEY;
     const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream?output_format=ulaw_8000`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": XI_API_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_turbo_v2",
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-        })
+    // Split into sentences so each plays quickly without waiting for full response
+    const sentences = text
+      .split(/(?<=[.!?])\s+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    for (const sentence of sentences) {
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream?output_format=ulaw_8000&optimize_streaming_latency=3`,
+        {
+          method: "POST",
+          headers: {
+            "xi-api-key": XI_API_KEY,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            text: sentence,
+            model_id: "eleven_turbo_v2",
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+          })
+        }
+      );
+
+      if (!response.ok) {
+        console.error("ElevenLabs error:", await response.text());
+        continue;
       }
-    );
 
-    if (!response.ok) {
-      console.error("ElevenLabs error:", await response.text());
-      return;
-    }
+      const audioBuffer = await response.arrayBuffer();
+      const base64Audio = Buffer.from(audioBuffer).toString("base64");
 
-    const audioBuffer = await response.arrayBuffer();
-    const base64Audio = Buffer.from(audioBuffer).toString("base64");
-
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: base64Audio }
-      }));
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: base64Audio }
+        }));
+      } else {
+        console.warn("WebSocket closed before audio could be sent");
+        break;
+      }
     }
 
   } catch (err) {
