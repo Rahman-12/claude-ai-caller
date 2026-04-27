@@ -5,11 +5,16 @@ import Anthropic from "@anthropic-ai/sdk";
 const PORT = process.env.PORT || 8080;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "ElectraBoostAI";
+const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
+const NOTIFY_EMAIL = "electraboostai@gmail.com";
+const NOTIFY_PHONE = "+447840910698";
+const HUBSPOT_PIPELINE_ID = "default";
+const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 
 // Store active call sessions keyed by callSid
 const sessions = new Map();
 
-// Create a plain HTTP server so we can route WebSocket paths
+// Create HTTP server to route WebSocket paths
 const server = createServer((req, res) => {
   res.writeHead(200);
   res.end(`${BUSINESS_NAME} AI Caller running`);
@@ -19,7 +24,6 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   const url = req.url;
-
   if (url === "/stream" || url === "/") {
     handleTwilioStream(ws);
   } else if (url === "/transcription") {
@@ -50,10 +54,15 @@ function handleTwilioStream(ws) {
         leadName = msg.start.customParameters?.leadName || "Customer";
         console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}`);
 
-        // Store session so transcription handler can find it
-        sessions.set(callSid, { ws, streamSid, conversationHistory, leadName });
+        sessions.set(callSid, {
+          ws,
+          streamSid,
+          conversationHistory,
+          leadName,
+          callSid,
+          qualifiedData: { jobType: null, location: null, timing: null }
+        });
 
-        // Send opening greeting
         await sendClaudeResponse({
           ws,
           streamSid,
@@ -65,18 +74,20 @@ function handleTwilioStream(ws) {
 
       case "stop":
         console.log(`Stream stopped — Call: ${callSid}`);
-        sessions.delete(callSid);
+        const session = sessions.get(callSid);
+        if (session) {
+          await handleCallEnded(session);
+          sessions.delete(callSid);
+        }
         break;
 
       case "media":
-        // Raw audio — handled via transcription websocket
         break;
     }
   });
 
   ws.on("close", () => {
     console.log("Stream WS closed");
-    if (callSid) sessions.delete(callSid);
   });
 
   ws.on("error", (err) => console.error("Stream WS error:", err));
@@ -91,10 +102,8 @@ function handleTranscription(ws) {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // Log all transcription events for debugging
     console.log("Transcription event received:", JSON.stringify(msg));
 
-    // Only process final transcripts
     if (msg.TranscriptionEvent !== "transcription-content") return;
     if (msg.Final !== "true") return;
 
@@ -118,7 +127,8 @@ function handleTranscription(ws) {
       streamSid,
       conversationHistory,
       leadName,
-      userMessage: transcript
+      userMessage: transcript,
+      session
     });
   });
 
@@ -128,7 +138,7 @@ function handleTranscription(ws) {
 
 // ─── Claude + TTS ─────────────────────────────────────────────────────────────
 
-async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage }) {
+async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage, session }) {
   try {
     if (userMessage) {
       conversationHistory.push({ role: "user", content: userMessage });
@@ -159,19 +169,258 @@ Rules you must follow:
 - If they seem uninterested or say wrong number, politely apologise on behalf of ${BUSINESS_NAME} and end the call
 - If they ask a technical electrical question, tell them the electrician will be best placed to advise when they call back
 - Once you have collected all 3 pieces of information (job type, location, timing) thank them warmly and say goodbye
-- Always be warm, confident and brief`,
+- Always be warm, confident and brief
+
+IMPORTANT: Once you have collected job type, location and timing — include this exact tag at the end of your response (invisible to the customer):
+[QUALIFIED: jobType=<job> | location=<location> | timing=<timing>]`,
       messages
     });
 
     const replyText = response.content[0].text;
-    console.log(`Claude: "${replyText}"`);
 
-    conversationHistory.push({ role: "assistant", content: replyText });
+    // Check if Claude has collected all 3 pieces of info
+    const qualifiedMatch = replyText.match(/\[QUALIFIED: jobType=(.+?) \| location=(.+?) \| timing=(.+?)\]/);
+    if (qualifiedMatch && session) {
+      session.qualifiedData = {
+        jobType: qualifiedMatch[1],
+        location: qualifiedMatch[2],
+        timing: qualifiedMatch[3]
+      };
+      session.isQualified = true;
+      console.log(`Lead qualified:`, session.qualifiedData);
+    }
 
-    await textToSpeechAndStream(ws, streamSid, replyText);
+    // Strip the tag before sending to TTS
+    const cleanReply = replyText.replace(/\[QUALIFIED:.*?\]/, "").trim();
+    console.log(`Claude: "${cleanReply}"`);
+
+    conversationHistory.push({ role: "assistant", content: cleanReply });
+
+    await textToSpeechAndStream(ws, streamSid, cleanReply);
 
   } catch (err) {
     console.error("Claude error:", err.message);
+  }
+}
+
+// ─── Handle Call Ended ────────────────────────────────────────────────────────
+
+async function handleCallEnded(session) {
+  const { leadName, callSid, conversationHistory, qualifiedData, isQualified } = session;
+
+  console.log(`Call ended for ${leadName} — Qualified: ${isQualified}`);
+
+  // Build transcript
+  const transcript = conversationHistory
+    .map(m => `${m.role === "user" ? leadName : "AI"}: ${m.content}`)
+    .join("\n");
+
+  if (!isQualified) {
+    console.log("Lead not qualified — skipping HubSpot update and notifications");
+    return;
+  }
+
+  try {
+    // 1. Find the contact in HubSpot by name
+    const contactId = await findHubSpotContact(leadName);
+
+    if (contactId) {
+      // 2. Log note on contact
+      await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
+
+      // 3. Move deal to Contacted stage
+      await updateDealStage(contactId, leadName);
+    } else {
+      console.warn(`No HubSpot contact found for ${leadName}`);
+    }
+
+    // 4. Send SMS notification to you
+    await sendSMSNotification(leadName, qualifiedData);
+
+    console.log("All post-call actions completed successfully");
+
+  } catch (err) {
+    console.error("Post-call error:", err.message);
+  }
+}
+
+// ─── HubSpot Functions ────────────────────────────────────────────────────────
+
+async function findHubSpotContact(leadName) {
+  try {
+    const firstName = leadName.split(" ")[0];
+
+    const response = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/search`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          filterGroups: [{
+            filters: [{
+              propertyName: "firstname",
+              operator: "EQ",
+              value: firstName
+            }]
+          }],
+          limit: 1
+        })
+      }
+    );
+
+    const data = await response.json();
+    const contactId = data.results?.[0]?.id;
+    console.log(`HubSpot contact found: ${contactId}`);
+    return contactId;
+
+  } catch (err) {
+    console.error("HubSpot contact search error:", err.message);
+    return null;
+  }
+}
+
+async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
+  try {
+    // Create the note as an engagement
+    const noteResponse = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/notes`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          properties: {
+            hs_note_body: `📞 AI Caller - Qualified Lead\n\nName: ${leadName}\nJob Type: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\n--- Full Transcript ---\n${transcript}`,
+            hs_timestamp: Date.now()
+          },
+          associations: [{
+            to: { id: contactId },
+            types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 202 }]
+          }]
+        })
+      }
+    );
+
+    const noteData = await noteResponse.json();
+    console.log("HubSpot note logged:", noteData.id);
+
+  } catch (err) {
+    console.error("HubSpot note error:", err.message);
+  }
+}
+
+async function updateDealStage(contactId, leadName) {
+  try {
+    // First find associated deal
+    const dealsResponse = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals`,
+      {
+        headers: { "Authorization": `Bearer ${HUBSPOT_API_KEY}` }
+      }
+    );
+
+    const dealsData = await dealsResponse.json();
+    const dealId = dealsData.results?.[0]?.id;
+
+    if (!dealId) {
+      console.warn(`No deal found for contact ${contactId} — creating one`);
+      await createDeal(contactId, leadName);
+      return;
+    }
+
+    // Update existing deal stage
+    const updateResponse = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/deals/${dealId}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          properties: {
+            dealstage: HUBSPOT_CONTACTED_STAGE,
+            pipeline: HUBSPOT_PIPELINE_ID
+          }
+        })
+      }
+    );
+
+    console.log("Deal stage updated to Contacted");
+
+  } catch (err) {
+    console.error("HubSpot deal update error:", err.message);
+  }
+}
+
+async function createDeal(contactId, leadName) {
+  try {
+    const response = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/deals`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          properties: {
+            dealname: `${leadName} - Electrician Enquiry`,
+            dealstage: HUBSPOT_CONTACTED_STAGE,
+            pipeline: HUBSPOT_PIPELINE_ID
+          },
+          associations: [{
+            to: { id: contactId },
+            types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 3 }]
+          }]
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("New deal created:", data.id);
+
+  } catch (err) {
+    console.error("HubSpot deal creation error:", err.message);
+  }
+}
+
+// ─── SMS Notification ─────────────────────────────────────────────────────────
+
+async function sendSMSNotification(leadName, qualifiedData) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const message = `🔌 ElectraBoostAI - New Qualified Lead!\n\nName: ${leadName}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\nLog into HubSpot to follow up.`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: NOTIFY_PHONE,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("SMS notification sent:", data.sid);
+
+  } catch (err) {
+    console.error("SMS notification error:", err.message);
   }
 }
 
