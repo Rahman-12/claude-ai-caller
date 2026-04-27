@@ -4,6 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 
 const PORT = process.env.PORT || 8080;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "ElectraBoostAI";
 
 // Store active call sessions keyed by callSid
 const sessions = new Map();
@@ -11,7 +12,7 @@ const sessions = new Map();
 // Create a plain HTTP server so we can route WebSocket paths
 const server = createServer((req, res) => {
   res.writeHead(200);
-  res.end("Claude AI Caller running");
+  res.end(`${BUSINESS_NAME} AI Caller running`);
 });
 
 const wss = new WebSocketServer({ server });
@@ -58,7 +59,7 @@ function handleTwilioStream(ws) {
           streamSid,
           conversationHistory,
           leadName,
-          userMessage: null // triggers greeting
+          userMessage: null
         });
         break;
 
@@ -68,7 +69,7 @@ function handleTwilioStream(ws) {
         break;
 
       case "media":
-        // Raw audio — handled via transcription websocket instead
+        // Raw audio — handled via transcription websocket
         break;
     }
   });
@@ -89,6 +90,9 @@ function handleTranscription(ws) {
   ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
+
+    // Log all transcription events for debugging
+    console.log("Transcription event received:", JSON.stringify(msg));
 
     // Only process final transcripts
     if (msg.TranscriptionEvent !== "transcription-content") return;
@@ -137,10 +141,25 @@ async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 200,
-      system: `You are a friendly and helpful inbound customer support agent. 
-The customer's name is ${leadName}. 
-Keep all responses concise and natural for voice — maximum 2-3 sentences. 
-Never use bullet points, markdown, or lists. Speak conversationally.`,
+      system: `You are a friendly and professional call handler working for ${BUSINESS_NAME}, a company that connects homeowners and businesses with qualified local electricians.
+You are calling ${leadName} because they just filled out a form showing interest in hiring a qualified local electrician.
+
+Your goals in this exact order are:
+1. Greet them warmly by name and confirm you are calling from ${BUSINESS_NAME} about their enquiry for an electrician
+2. Ask what electrical work they need done
+3. Ask for their postcode or general area so you can match them with a local electrician
+4. Ask when they need the work done — urgently, within the week, or just planning ahead
+5. Thank them, let them know a qualified local electrician from ${BUSINESS_NAME} will be in touch with them shortly, then say goodbye
+
+Rules you must follow:
+- Keep every response to 1-3 sentences maximum — this is a phone call not a chat
+- Sound natural and human — never robotic or scripted
+- Never mention you are an AI unless directly asked — if asked, say you are a call handler for ${BUSINESS_NAME}
+- Never make up prices, timelines, or electrician names
+- If they seem uninterested or say wrong number, politely apologise on behalf of ${BUSINESS_NAME} and end the call
+- If they ask a technical electrical question, tell them the electrician will be best placed to advise when they call back
+- Once you have collected all 3 pieces of information (job type, location, timing) thank them warmly and say goodbye
+- Always be warm, confident and brief`,
       messages
     });
 
@@ -155,6 +174,8 @@ Never use bullet points, markdown, or lists. Speak conversationally.`,
     console.error("Claude error:", err.message);
   }
 }
+
+// ─── Text to Speech ───────────────────────────────────────────────────────────
 
 async function textToSpeechAndStream(ws, streamSid, text) {
   try {
@@ -201,7 +222,7 @@ async function textToSpeechAndStream(ws, streamSid, text) {
 // ─── Start Server ─────────────────────────────────────────────────────────────
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`${BUSINESS_NAME} AI Caller running on port ${PORT}`);
 });
 
 setInterval(() => console.log("Server alive"), 30000);
