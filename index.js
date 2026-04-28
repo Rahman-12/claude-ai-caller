@@ -11,8 +11,230 @@ const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 
 const sessions = new Map();
+const scheduledCallbacks = new Map();
 
-// HTTP server handles both transcription POST callbacks and WebSocket upgrades
+// ─── UK Time Parser ───────────────────────────────────────────────────────────
+
+function parseCallbackTime(timeStr) {
+  const now = new Date();
+  const ukOffset = isUKSummerTime(now) ? 60 : 0;
+  const ukNow = new Date(now.getTime() + ukOffset * 60000);
+  const str = timeStr.toLowerCase().trim();
+
+  // "in X minutes/hours"
+  const inMatch = str.match(/in (\d+)\s*(minute|hour|min|hr)s?/);
+  if (inMatch) {
+    const amount = parseInt(inMatch[1]);
+    const unit = inMatch[2].startsWith("h") ? 60 : 1;
+    return new Date(now.getTime() + amount * unit * 60000);
+  }
+
+  // Vague time phrases
+  if (str.includes("few hours") || str.includes("couple of hours")) {
+    return new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  }
+  if (str.includes("later today") || str.includes("later on")) {
+    return new Date(now.getTime() + 4 * 60 * 60 * 1000);
+  }
+  if (str.includes("this afternoon")) {
+    const d = new Date(ukNow);
+    d.setHours(14, 0, 0, 0);
+    if (d <= ukNow) d.setDate(d.getDate() + 1);
+    return new Date(d.getTime() - ukOffset * 60000);
+  }
+  if (str.includes("this evening") || str.includes("tonight")) {
+    const d = new Date(ukNow);
+    d.setHours(19, 0, 0, 0);
+    if (d <= ukNow) d.setDate(d.getDate() + 1);
+    return new Date(d.getTime() - ukOffset * 60000);
+  }
+  if (str.includes("this morning")) {
+    const d = new Date(ukNow);
+    d.setHours(9, 0, 0, 0);
+    if (d <= ukNow) d.setDate(d.getDate() + 1);
+    return new Date(d.getTime() - ukOffset * 60000);
+  }
+  if (str.includes("next week") || str.includes("sometime next week")) {
+    const d = nextWeekday(ukNow, 1, 10, 0);
+    return new Date(d.getTime() - ukOffset * 60000);
+  }
+
+  // Extract time portion — "2pm", "14:00", "2:30pm"
+  const timeMatch = str.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+  let hours = timeMatch ? parseInt(timeMatch[1]) : 9;
+  let minutes = timeMatch && timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+  const ampm = timeMatch ? timeMatch[3] : null;
+
+  if (ampm === "pm" && hours < 12) hours += 12;
+  if (ampm === "am" && hours === 12) hours = 0;
+
+  // Find the target date
+  let targetDate = new Date(ukNow);
+  targetDate.setHours(hours, minutes, 0, 0);
+
+  if (str.includes("tomorrow")) {
+    targetDate.setDate(targetDate.getDate() + 1);
+  } else if (str.includes("monday")) {
+    targetDate = nextWeekday(ukNow, 1, hours, minutes);
+  } else if (str.includes("tuesday")) {
+    targetDate = nextWeekday(ukNow, 2, hours, minutes);
+  } else if (str.includes("wednesday")) {
+    targetDate = nextWeekday(ukNow, 3, hours, minutes);
+  } else if (str.includes("thursday")) {
+    targetDate = nextWeekday(ukNow, 4, hours, minutes);
+  } else if (str.includes("friday")) {
+    targetDate = nextWeekday(ukNow, 5, hours, minutes);
+  } else if (str.includes("saturday")) {
+    targetDate = nextWeekday(ukNow, 6, hours, minutes);
+  } else if (str.includes("sunday")) {
+    targetDate = nextWeekday(ukNow, 0, hours, minutes);
+  } else {
+    // Check for date like "the 3rd", "5th", "12th"
+    const dateMatch = str.match(/(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)/);
+    if (dateMatch) {
+      const day = parseInt(dateMatch[1]);
+      targetDate.setDate(day);
+      if (targetDate < ukNow) {
+        targetDate.setMonth(targetDate.getMonth() + 1);
+      }
+    } else {
+      // Default: if time today has passed, schedule for tomorrow
+      if (targetDate <= ukNow) {
+        targetDate.setDate(targetDate.getDate() + 1);
+      }
+    }
+  }
+
+  return new Date(targetDate.getTime() - ukOffset * 60000);
+}
+
+function nextWeekday(from, dayOfWeek, hours, minutes) {
+  const date = new Date(from);
+  const current = date.getDay();
+  let daysUntil = dayOfWeek - current;
+  if (daysUntil <= 0) daysUntil += 7;
+  date.setDate(date.getDate() + daysUntil);
+  date.setHours(hours, minutes, 0, 0);
+  return date;
+}
+
+function isUKSummerTime(date) {
+  const year = date.getFullYear();
+  const lastSundayMarch = getLastSunday(year, 2);
+  const lastSundayOctober = getLastSunday(year, 9);
+  return date >= lastSundayMarch && date < lastSundayOctober;
+}
+
+function getLastSunday(year, month) {
+  const date = new Date(year, month + 1, 0);
+  date.setDate(date.getDate() - date.getDay());
+  date.setHours(1, 0, 0, 0);
+  return date;
+}
+
+// ─── Callback Scheduler ───────────────────────────────────────────────────────
+
+function scheduleCallback(leadName, phone, callbackTimeStr) {
+  try {
+    const callbackDate = parseCallbackTime(callbackTimeStr);
+    const now = new Date();
+    const delay = callbackDate.getTime() - now.getTime();
+
+    if (delay <= 0) {
+      console.warn(`Callback time already passed for ${leadName} — scheduling in 5 minutes instead`);
+      scheduleCallbackInMs(leadName, phone, 5 * 60 * 1000, callbackTimeStr);
+      return;
+    }
+
+    const ukTime = new Date(callbackDate.getTime() + (isUKSummerTime(callbackDate) ? 60 : 0) * 60000);
+    console.log(`Callback scheduled for ${leadName} at ${ukTime.toLocaleString("en-GB")} (in ${Math.round(delay / 60000)} minutes)`);
+
+    scheduleCallbackInMs(leadName, phone, delay, callbackTimeStr);
+
+  } catch (err) {
+    console.error("Callback scheduling error:", err.message);
+  }
+}
+
+function scheduleCallbackInMs(leadName, phone, delayMs, callbackTimeStr) {
+  const callbackId = `${leadName}-${Date.now()}`;
+
+  const timeout = setTimeout(async () => {
+    console.log(`Triggering scheduled callback for ${leadName}`);
+    await triggerCallback(leadName, phone);
+    scheduledCallbacks.delete(callbackId);
+  }, delayMs);
+
+  scheduledCallbacks.set(callbackId, {
+    leadName,
+    phone,
+    callbackTimeStr,
+    timeout,
+    scheduledAt: new Date()
+  });
+
+  console.log(`Callback registered — ID: ${callbackId}, Total scheduled: ${scheduledCallbacks.size}`);
+}
+
+async function triggerCallback(leadName, phone) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+    const streamUrl = process.env.STREAM_URL;
+    const streamDomain = process.env.STREAM_URL_DOMAIN;
+
+    const safeLeadName = leadName
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Start>
+          <Transcription
+            track="inbound_track"
+            statusCallbackUrl="https://${streamDomain}/transcription"
+            partialResults="false"
+            languageCode="en-US"
+          />
+        </Start>
+        <Connect>
+          <Stream url="${streamUrl}">
+            <Parameter name="leadName" value="${safeLeadName}" />
+            <Parameter name="leadPhone" value="${phone}" />
+            <Parameter name="isCallback" value="true" />
+          </Stream>
+        </Connect>
+      </Response>`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: phone,
+          From: fromNumber,
+          Twiml: twiml
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log(`Callback call triggered — SID: ${data.sid}`);
+
+  } catch (err) {
+    console.error("Trigger callback error:", err.message);
+  }
+}
+
+// ─── HTTP Server ──────────────────────────────────────────────────────────────
+
 const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/transcription") {
     let body = "";
@@ -38,6 +260,13 @@ const server = createServer(async (req, res) => {
         if (transcript && callSid && isFinal) {
           const session = sessions.get(callSid);
           if (session) {
+            if (session.isSpeaking) {
+              console.log("Still speaking — ignoring transcript");
+              res.writeHead(200);
+              res.end("OK");
+              return;
+            }
+
             const { ws, streamSid, conversationHistory, leadName } = session;
             console.log(`Customer said: "${transcript}"`);
             await sendClaudeResponse({
@@ -64,7 +293,6 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Default response
   res.writeHead(200);
   res.end(`${BUSINESS_NAME} AI Caller running`);
 });
@@ -86,8 +314,10 @@ function handleTwilioStream(ws) {
   console.log("Twilio media stream connected");
 
   let leadName = "Customer";
+  let leadPhone = null;
   let callSid = null;
   let streamSid = null;
+  let isCallback = false;
   const conversationHistory = [];
 
   ws.on("message", async (raw) => {
@@ -99,14 +329,23 @@ function handleTwilioStream(ws) {
         streamSid = msg.start.streamSid;
         callSid = msg.start.callSid;
         leadName = msg.start.customParameters?.leadName || "Customer";
-        console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}`);
+        leadPhone = msg.start.customParameters?.leadPhone || null;
+        isCallback = msg.start.customParameters?.isCallback === "true";
+
+        console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}, Callback: ${isCallback}`);
 
         sessions.set(callSid, {
           ws,
           streamSid,
           conversationHistory,
           leadName,
+          leadPhone,
           callSid,
+          isCallback,
+          isSpeaking: false,
+          isQualified: false,
+          callbackRequested: false,
+          callbackTime: null,
           qualifiedData: { jobType: null, location: null, timing: null }
         });
 
@@ -115,7 +354,9 @@ function handleTwilioStream(ws) {
           streamSid,
           conversationHistory,
           leadName,
-          userMessage: null
+          isCallback,
+          userMessage: null,
+          session: sessions.get(callSid)
         });
         break;
 
@@ -133,16 +374,13 @@ function handleTwilioStream(ws) {
     }
   });
 
-  ws.on("close", () => {
-    console.log("Stream WS closed");
-  });
-
+  ws.on("close", () => console.log("Stream WS closed"));
   ws.on("error", (err) => console.error("Stream WS error:", err));
 }
 
 // ─── Claude + TTS ─────────────────────────────────────────────────────────────
 
-async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage, session }) {
+async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName, userMessage, session, isCallback }) {
   try {
     if (userMessage) {
       conversationHistory.push({ role: "user", content: userMessage });
@@ -152,11 +390,15 @@ async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName
       ? conversationHistory
       : [{ role: "user", content: "Begin the conversation." }];
 
+    const callbackIntro = isCallback
+      ? `This is a scheduled callback call — the customer previously asked to be called back at this time. Greet them warmly, remind them you are calling back as requested, and continue from where you left off collecting their electrician enquiry details.`
+      : `You are calling ${leadName} because they just filled out a form showing interest in hiring a qualified local electrician.`;
+
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 200,
       system: `You are a friendly and professional call handler named James, working for ${BUSINESS_NAME}, a company that connects homeowners and businesses with qualified local electricians.
-You are calling ${leadName} because they just filled out a form showing interest in hiring a qualified local electrician.
+${callbackIntro}
 
 Your goals in this exact order are:
 1. Greet them warmly by name, introduce yourself as James from ${BUSINESS_NAME}, and confirm you are calling about their electrician enquiry
@@ -172,11 +414,16 @@ Rules you must follow:
 - Never make up prices, timelines, or electrician names
 - If they seem uninterested or say wrong number, politely apologise on behalf of ${BUSINESS_NAME} and end the call
 - If they ask a technical electrical question, tell them the electrician will be best placed to advise when they call back
+- If the customer says it is not a good time, ask when would be better — if they give a vague answer like "in a few hours" or "later today" that is fine, accept it and confirm you will call them back
+- If the customer gives a callback time (exact or vague), confirm it warmly and say goodbye
 - Once you have collected all 3 pieces of information (job type, location, timing) thank them warmly and say goodbye
 - Always be warm, confident and brief
 
 IMPORTANT: Once you have collected job type, location and timing — include this exact tag at the end of your response (invisible to the customer):
-[QUALIFIED: jobType=<job> | location=<location> | timing=<timing>]`,
+[QUALIFIED: jobType=<job> | location=<location> | timing=<timing>]
+
+If the customer requests a callback at a specific or vague time, include this tag instead:
+[CALLBACK: time=<exact time and date they gave, or vague phrase like "in a few hours">]`,
       messages
     });
 
@@ -194,13 +441,24 @@ IMPORTANT: Once you have collected job type, location and timing — include thi
       console.log(`Lead qualified:`, session.qualifiedData);
     }
 
-    // Strip the tag before sending to TTS
-    const cleanReply = replyText.replace(/\[QUALIFIED:.*?\]/, "").trim();
-    console.log(`Claude: "${cleanReply}"`);
+    // Check for callback request
+    const callbackMatch = replyText.match(/\[CALLBACK: time=(.+?)\]/);
+    if (callbackMatch && session) {
+      session.callbackTime = callbackMatch[1];
+      session.callbackRequested = true;
+      console.log(`Callback requested for: ${session.callbackTime}`);
+    }
 
+    // Strip both tags before sending to TTS
+    const cleanReply = replyText
+      .replace(/\[QUALIFIED:.*?\]/, "")
+      .replace(/\[CALLBACK:.*?\]/, "")
+      .trim();
+
+    console.log(`Claude: "${cleanReply}"`);
     conversationHistory.push({ role: "assistant", content: cleanReply });
 
-    await textToSpeechAndStream(ws, streamSid, cleanReply);
+    await textToSpeechAndStream(ws, streamSid, cleanReply, session);
 
   } catch (err) {
     console.error("Claude error:", err.message);
@@ -210,35 +468,57 @@ IMPORTANT: Once you have collected job type, location and timing — include thi
 // ─── Handle Call Ended ────────────────────────────────────────────────────────
 
 async function handleCallEnded(session) {
-  const { leadName, callSid, conversationHistory, qualifiedData, isQualified } = session;
+  const { leadName, leadPhone, conversationHistory, qualifiedData, isQualified, callbackRequested, callbackTime } = session;
 
-  console.log(`Call ended for ${leadName} — Qualified: ${isQualified}`);
+  console.log(`Call ended for ${leadName} — Qualified: ${isQualified}, Callback: ${callbackRequested}`);
 
   const transcript = conversationHistory
     .map(m => `${m.role === "user" ? leadName : "James"}: ${m.content}`)
     .join("\n");
 
-  if (!isQualified) {
-    console.log("Lead not qualified — skipping HubSpot update and notifications");
-    return;
-  }
-
-  try {
-    const contactId = await findHubSpotContact(leadName);
-
-    if (contactId) {
-      await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
-      await updateDealStage(contactId, leadName);
-    } else {
-      console.warn(`No HubSpot contact found for ${leadName}`);
+  if (isQualified) {
+    console.log(`Lead qualified — processing HubSpot update`);
+    try {
+      const contactId = await findHubSpotContact(leadName);
+      if (contactId) {
+        await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
+        await updateDealStage(contactId, leadName);
+      } else {
+        console.warn(`No HubSpot contact found for ${leadName}`);
+      }
+      await sendSMSNotification(leadName, qualifiedData);
+      console.log("All post-call actions completed successfully");
+    } catch (err) {
+      console.error("Post-call error:", err.message);
     }
 
-    await sendSMSNotification(leadName, qualifiedData);
+  } else if (callbackRequested && callbackTime && leadPhone) {
+    console.log(`Callback requested for ${leadName} at ${callbackTime}`);
+    try {
+      const contactId = await findHubSpotContact(leadName);
+      if (contactId) {
+        await logHubSpotNote(
+          contactId,
+          leadName,
+          { jobType: "Callback requested", location: "TBC", timing: callbackTime },
+          transcript
+        );
+      } else {
+        console.warn(`No HubSpot contact found for ${leadName}`);
+      }
+      scheduleCallback(leadName, leadPhone, callbackTime);
+      await sendCallbackSMSNotification(leadName, callbackTime);
+      console.log("Callback scheduled and logged successfully");
+    } catch (err) {
+      console.error("Callback post-call error:", err.message);
+    }
 
-    console.log("All post-call actions completed successfully");
+  } else if (callbackRequested && !leadPhone) {
+    console.warn(`Callback requested but no phone number available for ${leadName} — cannot auto-schedule`);
+    await sendCallbackSMSNotification(leadName, callbackTime || "time not captured");
 
-  } catch (err) {
-    console.error("Post-call error:", err.message);
+  } else {
+    console.log("Call ended without qualification or callback — no action taken");
   }
 }
 
@@ -292,7 +572,7 @@ async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
         },
         body: JSON.stringify({
           properties: {
-            hs_note_body: `📞 AI Caller - Qualified Lead\n\nName: ${leadName}\nJob Type: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\n--- Full Transcript ---\n${transcript}`,
+            hs_note_body: `📞 AI Caller - ${qualifiedData.jobType === "Callback requested" ? "Callback Requested" : "Qualified Lead"}\n\nName: ${leadName}\nJob Type: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\n--- Full Transcript ---\n${transcript}`,
             hs_timestamp: Date.now()
           },
           associations: [{
@@ -385,7 +665,7 @@ async function createDeal(contactId, leadName) {
   }
 }
 
-// ─── SMS Notification ─────────────────────────────────────────────────────────
+// ─── SMS Notifications ────────────────────────────────────────────────────────
 
 async function sendSMSNotification(leadName, qualifiedData) {
   try {
@@ -419,14 +699,47 @@ async function sendSMSNotification(leadName, qualifiedData) {
   }
 }
 
+async function sendCallbackSMSNotification(leadName, callbackTime) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const message = `🔌 ElectraBoostAI - Callback Scheduled!\n\nName: ${leadName}\nCallback at: ${callbackTime}\n\nThe system will automatically call them back at this time.`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: NOTIFY_PHONE,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("Callback SMS sent:", data.sid);
+
+  } catch (err) {
+    console.error("Callback SMS error:", err.message);
+  }
+}
+
 // ─── Text to Speech ───────────────────────────────────────────────────────────
 
-async function textToSpeechAndStream(ws, streamSid, text) {
+async function textToSpeechAndStream(ws, streamSid, text, session) {
   try {
+    if (session) session.isSpeaking = true;
+
     const XI_API_KEY = process.env.ELEVENLABS_API_KEY;
     const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-    // Split into sentences so each plays quickly without waiting for full response
     const sentences = text
       .split(/(?<=[.!?])\s+/)
       .map(s => s.trim())
@@ -471,6 +784,8 @@ async function textToSpeechAndStream(ws, streamSid, text) {
 
   } catch (err) {
     console.error("TTS error:", err.message);
+  } finally {
+    if (session) session.isSpeaking = false;
   }
 }
 
