@@ -68,7 +68,6 @@ function parseCallbackTime(timeStr) {
   if (ampm === "pm" && hours < 12) hours += 12;
   if (ampm === "am" && hours === 12) hours = 0;
 
-  // Find the target date
   let targetDate = new Date(ukNow);
   targetDate.setHours(hours, minutes, 0, 0);
 
@@ -89,7 +88,6 @@ function parseCallbackTime(timeStr) {
   } else if (str.includes("sunday")) {
     targetDate = nextWeekday(ukNow, 0, hours, minutes);
   } else {
-    // Check for date like "the 3rd", "5th", "12th"
     const dateMatch = str.match(/(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)/);
     if (dateMatch) {
       const day = parseInt(dateMatch[1]);
@@ -98,7 +96,6 @@ function parseCallbackTime(timeStr) {
         targetDate.setMonth(targetDate.getMonth() + 1);
       }
     } else {
-      // Default: if time today has passed, schedule for tomorrow
       if (targetDate <= ukNow) {
         targetDate.setDate(targetDate.getDate() + 1);
       }
@@ -245,7 +242,6 @@ const server = createServer(async (req, res) => {
         const callSid = params.get("CallSid");
         const isFinal = params.get("Final") === "true" || params.get("TranscriptionStatus") === "completed";
 
-        // Parse transcript — Twilio sometimes returns it as a JSON string
         let rawTranscript = params.get("TranscriptionText") || params.get("TranscriptionData");
         let transcript = rawTranscript;
         try {
@@ -267,13 +263,17 @@ const server = createServer(async (req, res) => {
               return;
             }
 
+            if (!session.hasGreeted) session.hasGreeted = true;
+
             const { ws, streamSid, conversationHistory, leadName } = session;
             console.log(`Customer said: "${transcript}"`);
+
             await sendClaudeResponse({
               ws,
               streamSid,
               conversationHistory,
               leadName,
+              isCallback: session.isCallback,
               userMessage: transcript,
               session
             });
@@ -346,18 +346,11 @@ function handleTwilioStream(ws) {
           isQualified: false,
           callbackRequested: false,
           callbackTime: null,
+          hasGreeted: false,
           qualifiedData: { jobType: null, location: null, timing: null }
         });
 
-        await sendClaudeResponse({
-          ws,
-          streamSid,
-          conversationHistory,
-          leadName,
-          isCallback,
-          userMessage: null,
-          session: sessions.get(callSid)
-        });
+        // No automatic greeting — wait for customer to speak first
         break;
 
       case "stop":
@@ -401,8 +394,8 @@ async function sendClaudeResponse({ ws, streamSid, conversationHistory, leadName
 ${callbackIntro}
 
 Your goals in this exact order are:
-1. Greet them warmly by name, introduce yourself as James from ${BUSINESS_NAME}, and confirm you are calling about their electrician enquiry
-2. Ask what electrical work they need done
+1. Greet them warmly by name, introduce yourself as James from ${BUSINESS_NAME}, confirm you are calling about their electrician enquiry, and ALWAYS ask if now is a good time to chat before proceeding
+2. Only if they confirm it is a good time — ask what electrical work they need done
 3. Ask for their postcode or general area so you can match them with a local electrician
 4. Ask when they need the work done — urgently, within the week, or just planning ahead
 5. Thank them, let them know a qualified local electrician from ${BUSINESS_NAME} will be in touch with them shortly, then say goodbye
@@ -527,6 +520,7 @@ async function handleCallEnded(session) {
 async function findHubSpotContact(leadName) {
   try {
     const firstName = leadName.split(" ")[0];
+    const capitalisedName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
 
     const response = await fetch(
       `https://api.hubapi.com/crm/v3/objects/contacts/search`,
@@ -541,7 +535,7 @@ async function findHubSpotContact(leadName) {
             filters: [{
               propertyName: "firstname",
               operator: "EQ",
-              value: firstName
+              value: capitalisedName
             }]
           }],
           limit: 1
