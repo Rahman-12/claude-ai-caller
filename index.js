@@ -531,6 +531,8 @@ async function findHubSpotContact(leadName, leadPhone) {
   try {
     // First try phone number search — most reliable
     if (leadPhone) {
+      const cleanPhone = leadPhone.replace(/\s+/g, '');
+
       const phoneResponse = await fetch(
         `https://api.hubapi.com/crm/v3/objects/contacts/search`,
         {
@@ -544,15 +546,15 @@ async function findHubSpotContact(leadName, leadPhone) {
               {
                 filters: [{
                   propertyName: "phone",
-                  operator: "EQ",
-                  value: leadPhone
+                  operator: "CONTAINS_TOKEN",
+                  value: cleanPhone
                 }]
               },
               {
                 filters: [{
                   propertyName: "mobilephone",
-                  operator: "EQ",
-                  value: leadPhone
+                  operator: "CONTAINS_TOKEN",
+                  value: cleanPhone
                 }]
               }
             ],
@@ -568,6 +570,60 @@ async function findHubSpotContact(leadName, leadPhone) {
         return contactId;
       }
     }
+
+    // Fallback — search by first and last name
+    const firstName = leadName.split(" ")[0];
+    const lastName = leadName.split(" ")[1] || "";
+
+    const response = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/search`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "firstname",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstName
+                },
+                {
+                  propertyName: "lastname",
+                  operator: "CONTAINS_TOKEN",
+                  value: lastName
+                }
+              ]
+            },
+            {
+              filters: [
+                {
+                  propertyName: "firstname",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstName
+                }
+              ]
+            }
+          ],
+          limit: 1
+        })
+      }
+    );
+
+    const data = await response.json();
+    const contactId = data.results?.[0]?.id;
+    console.log(`HubSpot contact found by name: ${contactId}`);
+    return contactId;
+
+  } catch (err) {
+    console.error("HubSpot contact search error:", err.message);
+    return null;
+  }
+}
 
     // Fallback — search by first and last name
     const firstName = leadName.split(" ")[0];
