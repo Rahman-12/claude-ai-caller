@@ -262,7 +262,7 @@ const server = createServer(async (req, res) => {
               return;
             }
 
-            // Don't respond if James is still speaking
+            // Don't respond if James is still speaking or in cooldown
             if (session.isSpeaking) {
               console.log("Still speaking — ignoring transcript");
               res.writeHead(200);
@@ -482,7 +482,7 @@ async function handleCallEnded(session) {
   if (isQualified) {
     console.log(`Lead qualified — processing HubSpot update`);
     try {
-      const contactId = await findHubSpotContact(leadName);
+      const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
         await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
         await updateDealStage(contactId, leadName);
@@ -498,7 +498,7 @@ async function handleCallEnded(session) {
   } else if (callbackRequested && callbackTime && leadPhone) {
     console.log(`Callback requested for ${leadName} at ${callbackTime}`);
     try {
-      const contactId = await findHubSpotContact(leadName);
+      const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
         await logHubSpotNote(
           contactId,
@@ -527,8 +527,49 @@ async function handleCallEnded(session) {
 
 // ─── HubSpot Functions ────────────────────────────────────────────────────────
 
-async function findHubSpotContact(leadName) {
+async function findHubSpotContact(leadName, leadPhone) {
   try {
+    // First try phone number search — most reliable
+    if (leadPhone) {
+      const phoneResponse = await fetch(
+        `https://api.hubapi.com/crm/v3/objects/contacts/search`,
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            filterGroups: [
+              {
+                filters: [{
+                  propertyName: "phone",
+                  operator: "EQ",
+                  value: leadPhone
+                }]
+              },
+              {
+                filters: [{
+                  propertyName: "mobilephone",
+                  operator: "EQ",
+                  value: leadPhone
+                }]
+              }
+            ],
+            limit: 1
+          })
+        }
+      );
+
+      const phoneData = await phoneResponse.json();
+      const contactId = phoneData.results?.[0]?.id;
+      if (contactId) {
+        console.log(`HubSpot contact found by phone: ${contactId}`);
+        return contactId;
+      }
+    }
+
+    // Fallback — search by first and last name
     const firstName = leadName.split(" ")[0];
     const lastName = leadName.split(" ")[1] || "";
 
@@ -543,7 +584,6 @@ async function findHubSpotContact(leadName) {
         body: JSON.stringify({
           filterGroups: [
             {
-              // Try first + last name match
               filters: [
                 {
                   propertyName: "firstname",
@@ -558,7 +598,6 @@ async function findHubSpotContact(leadName) {
               ]
             },
             {
-              // Fallback — first name only
               filters: [
                 {
                   propertyName: "firstname",
@@ -575,7 +614,7 @@ async function findHubSpotContact(leadName) {
 
     const data = await response.json();
     const contactId = data.results?.[0]?.id;
-    console.log(`HubSpot contact found: ${contactId}`);
+    console.log(`HubSpot contact found by name: ${contactId}`);
     return contactId;
 
   } catch (err) {
@@ -809,6 +848,8 @@ async function textToSpeechAndStream(ws, streamSid, text, session) {
   } catch (err) {
     console.error("TTS error:", err.message);
   } finally {
+    // Cooldown after speaking to avoid catching our own echo
+    await new Promise(resolve => setTimeout(resolve, 1500));
     if (session) session.isSpeaking = false;
   }
 }
