@@ -21,7 +21,6 @@ function parseCallbackTime(timeStr) {
   const ukNow = new Date(now.getTime() + ukOffset * 60000);
   const str = timeStr.toLowerCase().trim();
 
-  // "in X minutes/hours"
   const inMatch = str.match(/in (\d+)\s*(minute|hour|min|hr)s?/);
   if (inMatch) {
     const amount = parseInt(inMatch[1]);
@@ -29,7 +28,6 @@ function parseCallbackTime(timeStr) {
     return new Date(now.getTime() + amount * unit * 60000);
   }
 
-  // Vague time phrases
   if (str.includes("few hours") || str.includes("couple of hours")) {
     return new Date(now.getTime() + 3 * 60 * 60 * 1000);
   }
@@ -59,7 +57,6 @@ function parseCallbackTime(timeStr) {
     return new Date(d.getTime() - ukOffset * 60000);
   }
 
-  // Extract time portion — "2pm", "14:00", "2:30pm"
   const timeMatch = str.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
   let hours = timeMatch ? parseInt(timeMatch[1]) : 9;
   let minutes = timeMatch && timeMatch[2] ? parseInt(timeMatch[2]) : 0;
@@ -256,6 +253,16 @@ const server = createServer(async (req, res) => {
         if (transcript && callSid && isFinal) {
           const session = sessions.get(callSid);
           if (session) {
+
+            // Don't respond if call is already concluded
+            if (session.hasSignedOff) {
+              console.log("Call already concluded — ignoring transcript");
+              res.writeHead(200);
+              res.end("OK");
+              return;
+            }
+
+            // Don't respond if James is still speaking
             if (session.isSpeaking) {
               console.log("Still speaking — ignoring transcript");
               res.writeHead(200);
@@ -344,6 +351,7 @@ function handleTwilioStream(ws) {
           isCallback,
           isSpeaking: false,
           isQualified: false,
+          hasSignedOff: false,
           callbackRequested: false,
           callbackTime: null,
           hasGreeted: false,
@@ -431,6 +439,7 @@ If the customer requests a callback at a specific or vague time, include this ta
         timing: qualifiedMatch[3]
       };
       session.isQualified = true;
+      session.hasSignedOff = true;
       console.log(`Lead qualified:`, session.qualifiedData);
     }
 
@@ -439,6 +448,7 @@ If the customer requests a callback at a specific or vague time, include this ta
     if (callbackMatch && session) {
       session.callbackTime = callbackMatch[1];
       session.callbackRequested = true;
+      session.hasSignedOff = true;
       console.log(`Callback requested for: ${session.callbackTime}`);
     }
 
@@ -520,7 +530,7 @@ async function handleCallEnded(session) {
 async function findHubSpotContact(leadName) {
   try {
     const firstName = leadName.split(" ")[0];
-    const capitalisedName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+    const lastName = leadName.split(" ")[1] || "";
 
     const response = await fetch(
       `https://api.hubapi.com/crm/v3/objects/contacts/search`,
@@ -531,13 +541,33 @@ async function findHubSpotContact(leadName) {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          filterGroups: [{
-            filters: [{
-              propertyName: "firstname",
-              operator: "EQ",
-              value: capitalisedName
-            }]
-          }],
+          filterGroups: [
+            {
+              // Try first + last name match
+              filters: [
+                {
+                  propertyName: "firstname",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstName
+                },
+                {
+                  propertyName: "lastname",
+                  operator: "CONTAINS_TOKEN",
+                  value: lastName
+                }
+              ]
+            },
+            {
+              // Fallback — first name only
+              filters: [
+                {
+                  propertyName: "firstname",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstName
+                }
+              ]
+            }
+          ],
           limit: 1
         })
       }
