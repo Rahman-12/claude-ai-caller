@@ -254,7 +254,6 @@ const server = createServer(async (req, res) => {
           const session = sessions.get(callSid);
           if (session) {
 
-            // Don't respond if call is already concluded
             if (session.hasSignedOff) {
               console.log("Call already concluded — ignoring transcript");
               res.writeHead(200);
@@ -262,7 +261,6 @@ const server = createServer(async (req, res) => {
               return;
             }
 
-            // Don't respond if James is still speaking or in cooldown
             if (session.isSpeaking) {
               console.log("Still speaking — ignoring transcript");
               res.writeHead(200);
@@ -358,7 +356,6 @@ function handleTwilioStream(ws) {
           qualifiedData: { jobType: null, location: null, timing: null }
         });
 
-        // No automatic greeting — wait for customer to speak first
         break;
 
       case "stop":
@@ -430,7 +427,6 @@ If the customer requests a callback at a specific or vague time, include this ta
 
     const replyText = response.content[0].text;
 
-    // Check if Claude has collected all 3 pieces of info
     const qualifiedMatch = replyText.match(/\[QUALIFIED: jobType=(.+?) \| location=(.+?) \| timing=(.+?)\]/);
     if (qualifiedMatch && session) {
       session.qualifiedData = {
@@ -443,7 +439,6 @@ If the customer requests a callback at a specific or vague time, include this ta
       console.log(`Lead qualified:`, session.qualifiedData);
     }
 
-    // Check for callback request
     const callbackMatch = replyText.match(/\[CALLBACK: time=(.+?)\]/);
     if (callbackMatch && session) {
       session.callbackTime = callbackMatch[1];
@@ -452,7 +447,6 @@ If the customer requests a callback at a specific or vague time, include this ta
       console.log(`Callback requested for: ${session.callbackTime}`);
     }
 
-    // Strip both tags before sending to TTS
     const cleanReply = replyText
       .replace(/\[QUALIFIED:.*?\]/, "")
       .replace(/\[CALLBACK:.*?\]/, "")
@@ -529,7 +523,6 @@ async function handleCallEnded(session) {
 
 async function findHubSpotContact(leadName, leadPhone) {
   try {
-    // First try phone number search — most reliable
     if (leadPhone) {
       const cleanPhone = leadPhone.replace(/\s+/g, '');
 
@@ -571,61 +564,6 @@ async function findHubSpotContact(leadName, leadPhone) {
       }
     }
 
-    // Fallback — search by first and last name
-    const firstName = leadName.split(" ")[0];
-    const lastName = leadName.split(" ")[1] || "";
-
-    const response = await fetch(
-      `https://api.hubapi.com/crm/v3/objects/contacts/search`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          filterGroups: [
-            {
-              filters: [
-                {
-                  propertyName: "firstname",
-                  operator: "CONTAINS_TOKEN",
-                  value: firstName
-                },
-                {
-                  propertyName: "lastname",
-                  operator: "CONTAINS_TOKEN",
-                  value: lastName
-                }
-              ]
-            },
-            {
-              filters: [
-                {
-                  propertyName: "firstname",
-                  operator: "CONTAINS_TOKEN",
-                  value: firstName
-                }
-              ]
-            }
-          ],
-          limit: 1
-        })
-      }
-    );
-
-    const data = await response.json();
-    const contactId = data.results?.[0]?.id;
-    console.log(`HubSpot contact found by name: ${contactId}`);
-    return contactId;
-
-  } catch (err) {
-    console.error("HubSpot contact search error:", err.message);
-    return null;
-  }
-}
-
-    // Fallback — search by first and last name
     const firstName = leadName.split(" ")[0];
     const lastName = leadName.split(" ")[1] || "";
 
