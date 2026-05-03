@@ -7,8 +7,10 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "ElectraBoostAI";
 const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
 const NOTIFY_PHONE = "+447840910698";
+const NOTIFY_EMAIL = "electraboostai@gmail.com";
 const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
+const BOOKING_LINK = "https://calendly.com/electraboostai/30min";
 
 const sessions = new Map();
 const scheduledCallbacks = new Map();
@@ -227,6 +229,66 @@ async function triggerCallback(leadName, phone) {
   }
 }
 
+// ─── Electrician Matching ─────────────────────────────────────────────────────
+
+async function findMatchingElectrician(location, jobType) {
+  try {
+    const response = await fetch(
+      `https://api.hubapi.com/crm/v3/objects/deals/search`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          filterGroups: [{
+            filters: [{
+              propertyName: "pipeline",
+              operator: "EQ",
+              value: "electrician_onboarding"
+            }]
+          }],
+          properties: [
+            "electrician_name",
+            "electrician_phone",
+            "electrician_email",
+            "service_areas",
+            "specialisms",
+            "calendly_link"
+          ],
+          limit: 100
+        })
+      }
+    );
+
+    const data = await response.json();
+    const electricians = data.results || [];
+
+    if (electricians.length === 0) return null;
+
+    // Match by area AND job type
+    const fullMatch = electricians.find(e => {
+      const areas = (e.properties.service_areas || "").toLowerCase();
+      const specialisms = (e.properties.specialisms || "").toLowerCase();
+      return areas.includes(location.toLowerCase()) &&
+             specialisms.includes(jobType.toLowerCase());
+    });
+
+    if (fullMatch) return fullMatch;
+
+    // Fallback — match by area only
+    return electricians.find(e => {
+      const areas = (e.properties.service_areas || "").toLowerCase();
+      return areas.includes(location.toLowerCase());
+    });
+
+  } catch (err) {
+    console.error("Electrician matching error:", err.message);
+    return null;
+  }
+}
+
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -403,7 +465,19 @@ Your goals in this exact order are:
 2. Only if they confirm it is a good time — ask what electrical work they need done
 3. Ask for their postcode or general area so you can match them with a local electrician
 4. Ask when they need the work done — urgently, within the week, or just planning ahead
-5. Thank them, let them know a qualified local electrician from ${BUSINESS_NAME} will be in touch with them shortly, then say goodbye
+5. Let them know a qualified local electrician will be in touch shortly, mention that you will also send them a link to book a convenient time, then say goodbye warmly
+
+Job type categories — always classify what the customer says into one of these:
+- Lighting installation or repair
+- Fuse box or consumer unit
+- Sockets and wiring
+- EV charger installation
+- Solar panels or battery storage
+- Security lighting or CCTV
+- Full rewire
+- Outdoor or garden electrics
+- General electrical inspection
+- Other electrical work
 
 Rules you must follow:
 - Keep every response to 1-3 sentences maximum — this is a phone call not a chat
@@ -414,11 +488,11 @@ Rules you must follow:
 - If they ask a technical electrical question, tell them the electrician will be best placed to advise when they call back
 - If the customer says it is not a good time, ask when would be better — if they give a vague answer like "in a few hours" or "later today" that is fine, accept it and confirm you will call them back
 - If the customer gives a callback time (exact or vague), confirm it warmly and say goodbye
-- Once you have collected all 3 pieces of information (job type, location, timing) thank them warmly and say goodbye
+- Once you have collected all 3 pieces of information (job type, location, timing) thank them warmly, mention the booking link SMS, and say goodbye
 - Always be warm, confident and brief
 
 IMPORTANT: Once you have collected job type, location and timing — include this exact tag at the end of your response (invisible to the customer):
-[QUALIFIED: jobType=<job> | location=<location> | timing=<timing>]
+[QUALIFIED: jobType=<standardised job category> | location=<location> | timing=<timing>]
 
 If the customer requests a callback at a specific or vague time, include this tag instead:
 [CALLBACK: time=<exact time and date they gave, or vague phrase like "in a few hours">]`,
@@ -476,14 +550,41 @@ async function handleCallEnded(session) {
   if (isQualified) {
     console.log(`Lead qualified — processing HubSpot update`);
     try {
+      // Find matching electrician
+      const electrician = await findMatchingElectrician(
+        qualifiedData.location,
+        qualifiedData.jobType
+      );
+
+      const bookingLink = electrician?.properties?.calendly_link || BOOKING_LINK;
+      const electricianName = electrician?.properties?.electrician_name || null;
+      const electricianPhone = electrician?.properties?.electrician_phone || null;
+      const electricianEmail = electrician?.properties?.electrician_email || null;
+
+      console.log(electrician
+        ? `Matched electrician: ${electricianName}`
+        : `No electrician matched — using default booking link`
+      );
+
       const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
-        await logHubSpotNote(contactId, leadName, qualifiedData, transcript);
+        await logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, electricianName);
         await updateDealStage(contactId, leadName);
       } else {
         console.warn(`No HubSpot contact found for ${leadName}`);
       }
-      await sendSMSNotification(leadName, qualifiedData);
+
+      // Send SMS to customer with booking link
+      await sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, bookingLink);
+
+      // Send SMS to you with full lead details
+      await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricianName);
+
+      // If electrician matched, notify them too
+      if (electricianPhone) {
+        await sendElectricianSMSNotification(electricianName, electricianPhone, leadName, leadPhone, qualifiedData, bookingLink);
+      }
+
       console.log("All post-call actions completed successfully");
     } catch (err) {
       console.error("Post-call error:", err.message);
@@ -498,7 +599,9 @@ async function handleCallEnded(session) {
           contactId,
           leadName,
           { jobType: "Callback requested", location: "TBC", timing: callbackTime },
-          transcript
+          transcript,
+          null,
+          null
         );
       } else {
         console.warn(`No HubSpot contact found for ${leadName}`);
@@ -511,7 +614,7 @@ async function handleCallEnded(session) {
     }
 
   } else if (callbackRequested && !leadPhone) {
-    console.warn(`Callback requested but no phone number available for ${leadName} — cannot auto-schedule`);
+    console.warn(`Callback requested but no phone number available for ${leadName}`);
     await sendCallbackSMSNotification(leadName, callbackTime || "time not captured");
 
   } else {
@@ -617,8 +720,16 @@ async function findHubSpotContact(leadName, leadPhone) {
   }
 }
 
-async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
+async function logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, electricianName) {
   try {
+    const electricianLine = electricianName
+      ? `Assigned Electrician: ${electricianName}\n`
+      : `Assigned Electrician: Pending assignment\n`;
+
+    const bookingLine = bookingLink
+      ? `Booking Link Sent: ${bookingLink}\n`
+      : "";
+
     const noteResponse = await fetch(
       `https://api.hubapi.com/crm/v3/objects/notes`,
       {
@@ -629,7 +740,7 @@ async function logHubSpotNote(contactId, leadName, qualifiedData, transcript) {
         },
         body: JSON.stringify({
           properties: {
-            hs_note_body: `📞 AI Caller - ${qualifiedData.jobType === "Callback requested" ? "Callback Requested" : "Qualified Lead"}\n\nName: ${leadName}\nJob Type: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\n--- Full Transcript ---\n${transcript}`,
+            hs_note_body: `📞 AI Caller - ${qualifiedData.jobType === "Callback requested" ? "Callback Requested" : "Qualified Lead"}\n\nName: ${leadName}\nJob Type: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n${electricianLine}${bookingLine}\n--- Full Transcript ---\n${transcript}`,
             hs_timestamp: Date.now()
           },
           associations: [{
@@ -724,13 +835,72 @@ async function createDeal(contactId, leadName) {
 
 // ─── SMS Notifications ────────────────────────────────────────────────────────
 
-async function sendSMSNotification(leadName, qualifiedData) {
+async function sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, bookingLink) {
+  try {
+    if (!leadPhone) return;
+
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const firstName = leadName.split(" ")[0];
+    const message = `Hi ${firstName}, it's James from ${BUSINESS_NAME}! Thanks for chatting with me just now about your ${qualifiedData.jobType.toLowerCase()} in ${qualifiedData.location}.\n\nA qualified local electrician will be in touch with you shortly.\n\nIn the meantime, you can book a convenient time here:\n${bookingLink}\n\nThanks again! 🔌`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: leadPhone,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("Customer SMS sent:", data.sid);
+
+  } catch (err) {
+    console.error("Customer SMS error:", err.message);
+  }
+}
+
+async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricianName) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_NUMBER;
 
-    const message = `🔌 ElectraBoostAI - New Qualified Lead!\n\nName: ${leadName}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\nLog into HubSpot to follow up.`;
+    // Fetch ad tracking data from HubSpot
+    let adName = "Unknown";
+    let campaignName = "Unknown";
+
+    if (contactId) {
+      try {
+        const contactResponse = await fetch(
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?properties=facebook_ad_name,facebook_campaign_name`,
+          {
+            headers: { "Authorization": `Bearer ${HUBSPOT_API_KEY}` }
+          }
+        );
+        const contactData = await contactResponse.json();
+        adName = contactData.properties?.facebook_ad_name || "Unknown";
+        campaignName = contactData.properties?.facebook_campaign_name || "Unknown";
+      } catch {
+        console.warn("Could not fetch ad tracking data");
+      }
+    }
+
+    const electricianLine = electricianName
+      ? `Electrician: ${electricianName}`
+      : `Electrician: Not yet assigned`;
+
+    const message = `🔌 ElectraBoostAI - New Qualified Lead!\n\nName: ${leadName}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n${electricianLine}\n\n📊 Ad Tracking:\nCampaign: ${campaignName}\nAd: ${adName}\n\nBooking link sent to customer:\n${bookingLink}\n\nLog into HubSpot to follow up.`;
 
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
@@ -749,10 +919,42 @@ async function sendSMSNotification(leadName, qualifiedData) {
     );
 
     const data = await response.json();
-    console.log("SMS notification sent:", data.sid);
+    console.log("Owner SMS sent:", data.sid);
 
   } catch (err) {
-    console.error("SMS notification error:", err.message);
+    console.error("Owner SMS error:", err.message);
+  }
+}
+
+async function sendElectricianSMSNotification(electricianName, electricianPhone, leadName, leadPhone, qualifiedData, bookingLink) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const message = `🔌 ElectraBoostAI - New Lead for You!\n\nHi ${electricianName}, you have a new lead:\n\nName: ${leadName}\nPhone: ${leadPhone}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\nThe customer has been sent this booking link:\n${bookingLink}\n\nPlease follow up with them as soon as possible!`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: electricianPhone,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("Electrician SMS sent:", data.sid);
+
+  } catch (err) {
+    console.error("Electrician SMS error:", err.message);
   }
 }
 
@@ -842,7 +1044,6 @@ async function textToSpeechAndStream(ws, streamSid, text, session) {
   } catch (err) {
     console.error("TTS error:", err.message);
   } finally {
-    // Cooldown after speaking to avoid catching our own echo
     await new Promise(resolve => setTimeout(resolve, 1500));
     if (session) session.isSpeaking = false;
   }
