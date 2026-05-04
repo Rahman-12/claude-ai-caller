@@ -10,9 +10,12 @@ const NOTIFY_PHONE = "+447840910698";
 const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 const BOOKING_LINK = "https://calendly.com/electraboostai/30min";
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 5 * 60 * 1000; // 5 minutes
 
 const sessions = new Map();
 const scheduledCallbacks = new Map();
+const retryTracker = new Map(); // Track retry attempts per phone number
 
 // ─── UK Time Parser ───────────────────────────────────────────────────────────
 
@@ -125,6 +128,105 @@ function getLastSunday(year, month) {
   date.setDate(date.getDate() - date.getDay());
   date.setHours(1, 0, 0, 0);
   return date;
+}
+
+// ─── Retry Logic ──────────────────────────────────────────────────────────────
+
+async function handleMissedCall(leadName, leadPhone) {
+  try {
+    const key = leadPhone;
+    const existing = retryTracker.get(key) || { attempts: 0, leadName };
+    const attempts = existing.attempts + 1;
+
+    console.log(`Missed call for ${leadName} — Attempt ${attempts} of ${MAX_RETRY_ATTEMPTS}`);
+
+    if (attempts < MAX_RETRY_ATTEMPTS) {
+      // Schedule retry
+      retryTracker.set(key, { attempts, leadName });
+
+      console.log(`Scheduling retry ${attempts + 1} in 5 minutes for ${leadName}`);
+
+      setTimeout(async () => {
+        console.log(`Retry attempt ${attempts + 1} for ${leadName}`);
+        await makeOutboundCall(leadName, leadPhone);
+      }, RETRY_DELAY_MS);
+
+    } else {
+      // All attempts exhausted
+      console.log(`All ${MAX_RETRY_ATTEMPTS} attempts exhausted for ${leadName} — sending SMS`);
+      retryTracker.delete(key);
+
+      // Send SMS to customer
+      await sendNoAnswerCustomerSMS(leadName, leadPhone);
+
+      // Send SMS to you
+      await sendNoAnswerOwnerSMS(leadName, leadPhone, MAX_RETRY_ATTEMPTS);
+    }
+
+  } catch (err) {
+    console.error("Missed call handler error:", err.message);
+  }
+}
+
+async function makeOutboundCall(leadName, leadPhone) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+    const streamUrl = process.env.STREAM_URL;
+    const streamDomain = process.env.STREAM_URL_DOMAIN;
+
+    const safeLeadName = leadName
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Start>
+          <Transcription
+            track="inbound_track"
+            statusCallbackUrl="https://${streamDomain}/transcription"
+            partialResults="false"
+            languageCode="en-US"
+          />
+        </Start>
+        <Connect>
+          <Stream url="${streamUrl}">
+            <Parameter name="leadName" value="${safeLeadName}" />
+            <Parameter name="leadPhone" value="${leadPhone}" />
+            <Parameter name="isCallback" value="false" />
+          </Stream>
+        </Connect>
+      </Response>`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: leadPhone,
+          From: fromNumber,
+          Twiml: twiml,
+          StatusCallback: `https://${streamDomain}/call-status`,
+          StatusCallbackMethod: "POST",
+          StatusCallbackEvent: "no-answer completed busy failed"
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log(`Outbound call triggered — SID: ${data.sid}`);
+    return data.sid;
+
+  } catch (err) {
+    console.error("Outbound call error:", err.message);
+  }
 }
 
 // ─── Callback Scheduler ───────────────────────────────────────────────────────
@@ -269,7 +371,6 @@ async function findMatchingElectricians(location, jobType) {
       return [];
     }
 
-    // Find ALL electricians matching area AND job type
     const fullMatches = electricians.filter(e => {
       const areas = (e.properties.service_areas || "").toLowerCase();
       const specialisms = (e.properties.specialisms || "").toLowerCase();
@@ -282,7 +383,6 @@ async function findMatchingElectricians(location, jobType) {
       return fullMatches;
     }
 
-    // Fallback — match by area only
     const areaMatches = electricians.filter(e => {
       const areas = (e.properties.service_areas || "").toLowerCase();
       return areas.includes(location.toLowerCase());
@@ -300,6 +400,8 @@ async function findMatchingElectricians(location, jobType) {
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
+
+  // Transcription POST handler
   if (req.method === "POST" && req.url === "/transcription") {
     let body = "";
     req.on("data", chunk => body += chunk.toString());
@@ -323,7 +425,6 @@ const server = createServer(async (req, res) => {
         if (transcript && callSid && isFinal) {
           const session = sessions.get(callSid);
           if (session) {
-
             if (session.hasSignedOff) {
               console.log("Call already concluded — ignoring transcript");
               res.writeHead(200);
@@ -361,6 +462,37 @@ const server = createServer(async (req, res) => {
         res.end("OK");
       } catch (err) {
         console.error("Transcription POST error:", err);
+        res.writeHead(500);
+        res.end("Error");
+      }
+    });
+    return;
+  }
+
+  // Call status webhook — handles no-answer and missed calls for retry logic
+  if (req.method === "POST" && req.url === "/call-status") {
+    let body = "";
+    req.on("data", chunk => body += chunk.toString());
+    req.on("end", async () => {
+      try {
+        const params = new URLSearchParams(body);
+        const callStatus = params.get("CallStatus");
+        const to = params.get("To");
+        const callSid = params.get("CallSid");
+
+        console.log(`Call status update — SID: ${callSid}, Status: ${callStatus}, To: ${to}`);
+
+        // Trigger retry if call was not answered
+        if (["no-answer", "busy", "failed"].includes(callStatus) && to) {
+          const retryData = retryTracker.get(to);
+          const leadName = retryData?.leadName || "Customer";
+          await handleMissedCall(leadName, to);
+        }
+
+        res.writeHead(200);
+        res.end("OK");
+      } catch (err) {
+        console.error("Call status error:", err);
         res.writeHead(500);
         res.end("Error");
       }
@@ -409,6 +541,14 @@ function handleTwilioStream(ws) {
 
         console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}, Callback: ${isCallback}`);
 
+        // Register in retry tracker so call-status webhook knows the lead name
+        if (leadPhone) {
+          const existing = retryTracker.get(leadPhone);
+          if (!existing) {
+            retryTracker.set(leadPhone, { attempts: 0, leadName });
+          }
+        }
+
         sessions.set(callSid, {
           ws,
           streamSid,
@@ -432,6 +572,11 @@ function handleTwilioStream(ws) {
         console.log(`Stream stopped — Call: ${callSid}`);
         const session = sessions.get(callSid);
         if (session) {
+          // If call was answered and qualified, clear retry tracker
+          if (session.isQualified || session.callbackRequested) {
+            retryTracker.delete(session.leadPhone);
+            console.log(`Retry tracker cleared for ${session.leadName} — call was successful`);
+          }
           await handleCallEnded(session);
           sessions.delete(callSid);
         }
@@ -558,7 +703,6 @@ async function handleCallEnded(session) {
   if (isQualified) {
     console.log(`Lead qualified — processing HubSpot update`);
     try {
-      // Find ALL matching electricians
       const electricians = await findMatchingElectricians(
         qualifiedData.location,
         qualifiedData.jobType
@@ -569,10 +713,8 @@ async function handleCallEnded(session) {
         : `No electricians matched — using default booking link`
       );
 
-      // Use first matched electrician's booking link or fall back to default
       const bookingLink = electricians[0]?.properties?.calendly_link || BOOKING_LINK;
 
-      // Find and update HubSpot contact
       const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
         const firstElecName = electricians[0]?.properties?.electrician_name || null;
@@ -582,13 +724,9 @@ async function handleCallEnded(session) {
         console.warn(`No HubSpot contact found for ${leadName}`);
       }
 
-      // Send booking link SMS to customer
       await sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, bookingLink);
-
-      // Send notification SMS to you
       await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricians);
 
-      // Notify ALL matched electricians simultaneously
       for (const electrician of electricians) {
         const elecName = electrician.properties.electrician_name;
         const elecPhone = electrician.properties.electrician_phone;
@@ -602,7 +740,7 @@ async function handleCallEnded(session) {
             leadPhone,
             qualifiedData,
             elecLink,
-            electricians.length > 1 // pass flag if competing
+            electricians.length > 1
           );
         }
       }
@@ -898,7 +1036,6 @@ async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLi
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_NUMBER;
 
-    // Fetch ad tracking data from HubSpot
     let adName = "Unknown";
     let campaignName = "Unknown";
 
@@ -981,6 +1118,71 @@ async function sendElectricianSMSNotification(electricianName, electricianPhone,
 
   } catch (err) {
     console.error("Electrician SMS error:", err.message);
+  }
+}
+
+async function sendNoAnswerCustomerSMS(leadName, leadPhone) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const firstName = leadName.split(" ")[0];
+    const message = `Hi ${firstName}, this is James from ${BUSINESS_NAME}. We tried calling you a few times about your electrician enquiry but couldn't get through.\n\nWhenever you're ready, you can book a convenient time here:\n${BOOKING_LINK}\n\nOr simply reply to this message and we'll get back to you. 🔌`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: leadPhone,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("No-answer customer SMS sent:", data.sid);
+
+  } catch (err) {
+    console.error("No-answer customer SMS error:", err.message);
+  }
+}
+
+async function sendNoAnswerOwnerSMS(leadName, leadPhone, attempts) {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_NUMBER;
+
+    const message = `❌ ElectraBoostAI - No Answer\n\nName: ${leadName}\nPhone: ${leadPhone}\nAttempts: ${attempts}\n\nAll retries exhausted. SMS sent to customer with booking link.\n\nLog into HubSpot to follow up manually if needed.`;
+
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          To: NOTIFY_PHONE,
+          From: fromNumber,
+          Body: message
+        })
+      }
+    );
+
+    const data = await response.json();
+    console.log("No-answer owner SMS sent:", data.sid);
+
+  } catch (err) {
+    console.error("No-answer owner SMS error:", err.message);
   }
 }
 
