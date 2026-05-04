@@ -7,7 +7,6 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "ElectraBoostAI";
 const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
 const NOTIFY_PHONE = "+447840910698";
-const NOTIFY_EMAIL = "electraboostai@gmail.com";
 const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 const BOOKING_LINK = "https://calendly.com/electraboostai/30min";
@@ -231,7 +230,7 @@ async function triggerCallback(leadName, phone) {
 
 // ─── Electrician Matching ─────────────────────────────────────────────────────
 
-async function findMatchingElectrician(location, jobType) {
+async function findMatchingElectricians(location, jobType) {
   try {
     const response = await fetch(
       `https://api.hubapi.com/crm/v3/objects/deals/search`,
@@ -265,27 +264,36 @@ async function findMatchingElectrician(location, jobType) {
     const data = await response.json();
     const electricians = data.results || [];
 
-    if (electricians.length === 0) return null;
+    if (electricians.length === 0) {
+      console.log("No electricians found in HubSpot pipeline");
+      return [];
+    }
 
-    // Match by area AND job type
-    const fullMatch = electricians.find(e => {
+    // Find ALL electricians matching area AND job type
+    const fullMatches = electricians.filter(e => {
       const areas = (e.properties.service_areas || "").toLowerCase();
       const specialisms = (e.properties.specialisms || "").toLowerCase();
       return areas.includes(location.toLowerCase()) &&
              specialisms.includes(jobType.toLowerCase());
     });
 
-    if (fullMatch) return fullMatch;
+    if (fullMatches.length > 0) {
+      console.log(`Found ${fullMatches.length} electricians matching area AND job type`);
+      return fullMatches;
+    }
 
     // Fallback — match by area only
-    return electricians.find(e => {
+    const areaMatches = electricians.filter(e => {
       const areas = (e.properties.service_areas || "").toLowerCase();
       return areas.includes(location.toLowerCase());
     });
 
+    console.log(`Found ${areaMatches.length} electricians matching area only`);
+    return areaMatches;
+
   } catch (err) {
     console.error("Electrician matching error:", err.message);
-    return null;
+    return [];
   }
 }
 
@@ -550,39 +558,53 @@ async function handleCallEnded(session) {
   if (isQualified) {
     console.log(`Lead qualified — processing HubSpot update`);
     try {
-      // Find matching electrician
-      const electrician = await findMatchingElectrician(
+      // Find ALL matching electricians
+      const electricians = await findMatchingElectricians(
         qualifiedData.location,
         qualifiedData.jobType
       );
 
-      const bookingLink = electrician?.properties?.calendly_link || BOOKING_LINK;
-      const electricianName = electrician?.properties?.electrician_name || null;
-      const electricianPhone = electrician?.properties?.electrician_phone || null;
-      const electricianEmail = electrician?.properties?.electrician_email || null;
-
-      console.log(electrician
-        ? `Matched electrician: ${electricianName}`
-        : `No electrician matched — using default booking link`
+      console.log(electricians.length > 0
+        ? `Matched ${electricians.length} electrician(s) — notifying all`
+        : `No electricians matched — using default booking link`
       );
 
+      // Use first matched electrician's booking link or fall back to default
+      const bookingLink = electricians[0]?.properties?.calendly_link || BOOKING_LINK;
+
+      // Find and update HubSpot contact
       const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
-        await logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, electricianName);
+        const firstElecName = electricians[0]?.properties?.electrician_name || null;
+        await logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, firstElecName);
         await updateDealStage(contactId, leadName);
       } else {
         console.warn(`No HubSpot contact found for ${leadName}`);
       }
 
-      // Send SMS to customer with booking link
+      // Send booking link SMS to customer
       await sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, bookingLink);
 
-      // Send SMS to you with full lead details
-      await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricianName);
+      // Send notification SMS to you
+      await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricians);
 
-      // If electrician matched, notify them too
-      if (electricianPhone) {
-        await sendElectricianSMSNotification(electricianName, electricianPhone, leadName, leadPhone, qualifiedData, bookingLink);
+      // Notify ALL matched electricians simultaneously
+      for (const electrician of electricians) {
+        const elecName = electrician.properties.electrician_name;
+        const elecPhone = electrician.properties.electrician_phone;
+        const elecLink = electrician.properties.calendly_link || BOOKING_LINK;
+
+        if (elecPhone) {
+          await sendElectricianSMSNotification(
+            elecName,
+            elecPhone,
+            leadName,
+            leadPhone,
+            qualifiedData,
+            elecLink,
+            electricians.length > 1 // pass flag if competing
+          );
+        }
       }
 
       console.log("All post-call actions completed successfully");
@@ -870,7 +892,7 @@ async function sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, b
   }
 }
 
-async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricianName) {
+async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricians) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -896,9 +918,9 @@ async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLi
       }
     }
 
-    const electricianLine = electricianName
-      ? `Electrician: ${electricianName}`
-      : `Electrician: Not yet assigned`;
+    const electricianLine = electricians.length > 0
+      ? `Electricians Notified: ${electricians.map(e => e.properties.electrician_name).join(", ")}`
+      : `Electricians: None matched — follow up manually`;
 
     const message = `🔌 ElectraBoostAI - New Qualified Lead!\n\nName: ${leadName}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n${electricianLine}\n\n📊 Ad Tracking:\nCampaign: ${campaignName}\nAd: ${adName}\n\nBooking link sent to customer:\n${bookingLink}\n\nLog into HubSpot to follow up.`;
 
@@ -926,13 +948,17 @@ async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLi
   }
 }
 
-async function sendElectricianSMSNotification(electricianName, electricianPhone, leadName, leadPhone, qualifiedData, bookingLink) {
+async function sendElectricianSMSNotification(electricianName, electricianPhone, leadName, leadPhone, qualifiedData, bookingLink, isCompeting) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_NUMBER;
 
-    const message = `🔌 ElectraBoostAI - New Lead for You!\n\nHi ${electricianName}, you have a new lead:\n\nName: ${leadName}\nPhone: ${leadPhone}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\nThe customer has been sent this booking link:\n${bookingLink}\n\nPlease follow up with them as soon as possible!`;
+    const competingLine = isCompeting
+      ? `\n⚡ FIRST TO CALL GETS THE JOB!`
+      : "";
+
+    const message = `🔌 ElectraBoostAI - New Lead for You!\n\nHi ${electricianName}, you have a new lead:${competingLine}\n\nName: ${leadName}\nPhone: ${leadPhone}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n\nBooking link sent to customer:\n${bookingLink}\n\nCall them now! 🔌`;
 
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
@@ -951,7 +977,7 @@ async function sendElectricianSMSNotification(electricianName, electricianPhone,
     );
 
     const data = await response.json();
-    console.log("Electrician SMS sent:", data.sid);
+    console.log(`Electrician SMS sent to ${electricianName}:`, data.sid);
 
   } catch (err) {
     console.error("Electrician SMS error:", err.message);
