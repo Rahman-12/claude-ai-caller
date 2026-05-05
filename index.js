@@ -9,7 +9,7 @@ const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
 const NOTIFY_PHONE = "+447840910698";
 const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
-const BOOKING_LINK = "https://calendly.com/electraboostai/30min";
+const bookingLink = BOOKING_LINK;
 const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 5 * 60 * 1000; // 5 minutes
 
