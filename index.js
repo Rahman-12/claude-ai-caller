@@ -11,11 +11,11 @@ const HUBSPOT_PIPELINE_ID = "default";
 const HUBSPOT_CONTACTED_STAGE = "qualifiedtobuy";
 const BOOKING_LINK = "https://calendly.com/electraboostai/30min";
 const MAX_RETRY_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+const RETRY_DELAY_MS = 5 * 60 * 1000;
 
 const sessions = new Map();
 const scheduledCallbacks = new Map();
-const retryTracker = new Map(); // Track retry attempts per phone number
+const retryTracker = new Map();
 
 // ─── UK Time Parser ───────────────────────────────────────────────────────────
 
@@ -132,34 +132,40 @@ function getLastSunday(year, month) {
 
 // ─── Retry Logic ──────────────────────────────────────────────────────────────
 
-async function handleMissedCall(leadName, leadPhone) {
+async function handleMissedCall(leadName, leadPhone, electricianName, electricianPhone, electricianCalendly) {
   try {
     const key = leadPhone;
-    const existing = retryTracker.get(key) || { attempts: 0, leadName };
+    const existing = retryTracker.get(key) || {
+      attempts: 0,
+      leadName,
+      electricianName,
+      electricianPhone,
+      electricianCalendly
+    };
     const attempts = existing.attempts + 1;
 
     console.log(`Missed call for ${leadName} — Attempt ${attempts} of ${MAX_RETRY_ATTEMPTS}`);
 
     if (attempts < MAX_RETRY_ATTEMPTS) {
-      // Schedule retry
-      retryTracker.set(key, { attempts, leadName });
+      retryTracker.set(key, {
+        attempts,
+        leadName,
+        electricianName,
+        electricianPhone,
+        electricianCalendly
+      });
 
       console.log(`Scheduling retry ${attempts + 1} in 5 minutes for ${leadName}`);
 
       setTimeout(async () => {
         console.log(`Retry attempt ${attempts + 1} for ${leadName}`);
-        await makeOutboundCall(leadName, leadPhone);
+        await makeOutboundCall(leadName, leadPhone, electricianName, electricianPhone, electricianCalendly);
       }, RETRY_DELAY_MS);
 
     } else {
-      // All attempts exhausted
       console.log(`All ${MAX_RETRY_ATTEMPTS} attempts exhausted for ${leadName} — sending SMS`);
       retryTracker.delete(key);
-
-      // Send SMS to customer
-      await sendNoAnswerCustomerSMS(leadName, leadPhone);
-
-      // Send SMS to you
+      await sendNoAnswerCustomerSMS(leadName, leadPhone, electricianCalendly || BOOKING_LINK);
       await sendNoAnswerOwnerSMS(leadName, leadPhone, MAX_RETRY_ATTEMPTS);
     }
 
@@ -168,7 +174,7 @@ async function handleMissedCall(leadName, leadPhone) {
   }
 }
 
-async function makeOutboundCall(leadName, leadPhone) {
+async function makeOutboundCall(leadName, leadPhone, electricianName, electricianPhone, electricianCalendly) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -177,6 +183,18 @@ async function makeOutboundCall(leadName, leadPhone) {
     const streamDomain = process.env.STREAM_URL_DOMAIN;
 
     const safeLeadName = leadName
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const safeElectricianName = (electricianName || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const safeElectricianCalendly = (electricianCalendly || "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -196,6 +214,9 @@ async function makeOutboundCall(leadName, leadPhone) {
           <Stream url="${streamUrl}">
             <Parameter name="leadName" value="${safeLeadName}" />
             <Parameter name="leadPhone" value="${leadPhone}" />
+            <Parameter name="electricianName" value="${safeElectricianName}" />
+            <Parameter name="electricianPhone" value="${electricianPhone || ''}" />
+            <Parameter name="electricianCalendly" value="${safeElectricianCalendly}" />
             <Parameter name="isCallback" value="false" />
           </Stream>
         </Connect>
@@ -231,7 +252,7 @@ async function makeOutboundCall(leadName, leadPhone) {
 
 // ─── Callback Scheduler ───────────────────────────────────────────────────────
 
-function scheduleCallback(leadName, phone, callbackTimeStr) {
+function scheduleCallback(leadName, phone, callbackTimeStr, electricianName, electricianPhone, electricianCalendly) {
   try {
     const callbackDate = parseCallbackTime(callbackTimeStr);
     const now = new Date();
@@ -239,26 +260,26 @@ function scheduleCallback(leadName, phone, callbackTimeStr) {
 
     if (delay <= 0) {
       console.warn(`Callback time already passed for ${leadName} — scheduling in 5 minutes instead`);
-      scheduleCallbackInMs(leadName, phone, 5 * 60 * 1000, callbackTimeStr);
+      scheduleCallbackInMs(leadName, phone, 5 * 60 * 1000, callbackTimeStr, electricianName, electricianPhone, electricianCalendly);
       return;
     }
 
     const ukTime = new Date(callbackDate.getTime() + (isUKSummerTime(callbackDate) ? 60 : 0) * 60000);
     console.log(`Callback scheduled for ${leadName} at ${ukTime.toLocaleString("en-GB")} (in ${Math.round(delay / 60000)} minutes)`);
 
-    scheduleCallbackInMs(leadName, phone, delay, callbackTimeStr);
+    scheduleCallbackInMs(leadName, phone, delay, callbackTimeStr, electricianName, electricianPhone, electricianCalendly);
 
   } catch (err) {
     console.error("Callback scheduling error:", err.message);
   }
 }
 
-function scheduleCallbackInMs(leadName, phone, delayMs, callbackTimeStr) {
+function scheduleCallbackInMs(leadName, phone, delayMs, callbackTimeStr, electricianName, electricianPhone, electricianCalendly) {
   const callbackId = `${leadName}-${Date.now()}`;
 
   const timeout = setTimeout(async () => {
     console.log(`Triggering scheduled callback for ${leadName}`);
-    await triggerCallback(leadName, phone);
+    await triggerCallback(leadName, phone, electricianName, electricianPhone, electricianCalendly);
     scheduledCallbacks.delete(callbackId);
   }, delayMs);
 
@@ -266,6 +287,9 @@ function scheduleCallbackInMs(leadName, phone, delayMs, callbackTimeStr) {
     leadName,
     phone,
     callbackTimeStr,
+    electricianName,
+    electricianPhone,
+    electricianCalendly,
     timeout,
     scheduledAt: new Date()
   });
@@ -273,7 +297,7 @@ function scheduleCallbackInMs(leadName, phone, delayMs, callbackTimeStr) {
   console.log(`Callback registered — ID: ${callbackId}, Total scheduled: ${scheduledCallbacks.size}`);
 }
 
-async function triggerCallback(leadName, phone) {
+async function triggerCallback(leadName, phone, electricianName, electricianPhone, electricianCalendly) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -282,6 +306,18 @@ async function triggerCallback(leadName, phone) {
     const streamDomain = process.env.STREAM_URL_DOMAIN;
 
     const safeLeadName = leadName
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const safeElectricianName = (electricianName || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const safeElectricianCalendly = (electricianCalendly || "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -301,6 +337,9 @@ async function triggerCallback(leadName, phone) {
           <Stream url="${streamUrl}">
             <Parameter name="leadName" value="${safeLeadName}" />
             <Parameter name="leadPhone" value="${phone}" />
+            <Parameter name="electricianName" value="${safeElectricianName}" />
+            <Parameter name="electricianPhone" value="${electricianPhone || ''}" />
+            <Parameter name="electricianCalendly" value="${safeElectricianCalendly}" />
             <Parameter name="isCallback" value="true" />
           </Stream>
         </Connect>
@@ -330,78 +369,10 @@ async function triggerCallback(leadName, phone) {
   }
 }
 
-// ─── Electrician Matching ─────────────────────────────────────────────────────
-
-async function findMatchingElectricians(location, jobType) {
-  try {
-    const response = await fetch(
-      `https://api.hubapi.com/crm/v3/objects/deals/search`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${HUBSPOT_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          filterGroups: [{
-            filters: [{
-              propertyName: "pipeline",
-              operator: "EQ",
-              value: "electrician_onboarding"
-            }]
-          }],
-          properties: [
-            "electrician_name",
-            "electrician_phone",
-            "electrician_email",
-            "service_areas",
-            "specialisms",
-            "calendly_link"
-          ],
-          limit: 100
-        })
-      }
-    );
-
-    const data = await response.json();
-    const electricians = data.results || [];
-
-    if (electricians.length === 0) {
-      console.log("No electricians found in HubSpot pipeline");
-      return [];
-    }
-
-    const fullMatches = electricians.filter(e => {
-      const areas = (e.properties.service_areas || "").toLowerCase();
-      const specialisms = (e.properties.specialisms || "").toLowerCase();
-      return areas.includes(location.toLowerCase()) &&
-             specialisms.includes(jobType.toLowerCase());
-    });
-
-    if (fullMatches.length > 0) {
-      console.log(`Found ${fullMatches.length} electricians matching area AND job type`);
-      return fullMatches;
-    }
-
-    const areaMatches = electricians.filter(e => {
-      const areas = (e.properties.service_areas || "").toLowerCase();
-      return areas.includes(location.toLowerCase());
-    });
-
-    console.log(`Found ${areaMatches.length} electricians matching area only`);
-    return areaMatches;
-
-  } catch (err) {
-    console.error("Electrician matching error:", err.message);
-    return [];
-  }
-}
-
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
 
-  // Transcription POST handler
   if (req.method === "POST" && req.url === "/transcription") {
     let body = "";
     req.on("data", chunk => body += chunk.toString());
@@ -469,7 +440,6 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Call status webhook — handles no-answer and missed calls for retry logic
   if (req.method === "POST" && req.url === "/call-status") {
     let body = "";
     req.on("data", chunk => body += chunk.toString());
@@ -482,11 +452,13 @@ const server = createServer(async (req, res) => {
 
         console.log(`Call status update — SID: ${callSid}, Status: ${callStatus}, To: ${to}`);
 
-        // Trigger retry if call was not answered
         if (["no-answer", "busy", "failed"].includes(callStatus) && to) {
           const retryData = retryTracker.get(to);
           const leadName = retryData?.leadName || "Customer";
-          await handleMissedCall(leadName, to);
+          const electricianName = retryData?.electricianName || null;
+          const electricianPhone = retryData?.electricianPhone || null;
+          const electricianCalendly = retryData?.electricianCalendly || null;
+          await handleMissedCall(leadName, to, electricianName, electricianPhone, electricianCalendly);
         }
 
         res.writeHead(200);
@@ -525,6 +497,9 @@ function handleTwilioStream(ws) {
   let callSid = null;
   let streamSid = null;
   let isCallback = false;
+  let electricianName = null;
+  let electricianPhone = null;
+  let electricianCalendly = null;
   const conversationHistory = [];
 
   ws.on("message", async (raw) => {
@@ -538,14 +513,22 @@ function handleTwilioStream(ws) {
         leadName = msg.start.customParameters?.leadName || "Customer";
         leadPhone = msg.start.customParameters?.leadPhone || null;
         isCallback = msg.start.customParameters?.isCallback === "true";
+        electricianName = msg.start.customParameters?.electricianName || null;
+        electricianPhone = msg.start.customParameters?.electricianPhone || null;
+        electricianCalendly = msg.start.customParameters?.electricianCalendly || null;
 
-        console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}, Callback: ${isCallback}`);
+        console.log(`Stream started — Call: ${callSid}, Lead: ${leadName}, Electrician: ${electricianName || "None"}, Callback: ${isCallback}`);
 
-        // Register in retry tracker so call-status webhook knows the lead name
         if (leadPhone) {
           const existing = retryTracker.get(leadPhone);
           if (!existing) {
-            retryTracker.set(leadPhone, { attempts: 0, leadName });
+            retryTracker.set(leadPhone, {
+              attempts: 0,
+              leadName,
+              electricianName,
+              electricianPhone,
+              electricianCalendly
+            });
           }
         }
 
@@ -557,6 +540,9 @@ function handleTwilioStream(ws) {
           leadPhone,
           callSid,
           isCallback,
+          electricianName,
+          electricianPhone,
+          electricianCalendly,
           isSpeaking: false,
           isQualified: false,
           hasSignedOff: false,
@@ -572,7 +558,6 @@ function handleTwilioStream(ws) {
         console.log(`Stream stopped — Call: ${callSid}`);
         const session = sessions.get(callSid);
         if (session) {
-          // If call was answered and qualified, clear retry tracker
           if (session.isQualified || session.callbackRequested) {
             retryTracker.delete(session.leadPhone);
             console.log(`Retry tracker cleared for ${session.leadName} — call was successful`);
@@ -692,57 +677,59 @@ If the customer requests a callback at a specific or vague time, include this ta
 // ─── Handle Call Ended ────────────────────────────────────────────────────────
 
 async function handleCallEnded(session) {
-  const { leadName, leadPhone, conversationHistory, qualifiedData, isQualified, callbackRequested, callbackTime } = session;
+  const {
+    leadName,
+    leadPhone,
+    conversationHistory,
+    qualifiedData,
+    isQualified,
+    callbackRequested,
+    callbackTime,
+    electricianName,
+    electricianPhone,
+    electricianCalendly
+  } = session;
 
-  console.log(`Call ended for ${leadName} — Qualified: ${isQualified}, Callback: ${callbackRequested}`);
+  console.log(`Call ended for ${leadName} — Qualified: ${isQualified}, Callback: ${callbackRequested}, Electrician: ${electricianName || "None"}`);
 
   const transcript = conversationHistory
     .map(m => `${m.role === "user" ? leadName : "James"}: ${m.content}`)
     .join("\n");
 
+  // Use electrician's Calendly if available, otherwise use default
+  const bookingLink = electricianCalendly || BOOKING_LINK;
+
   if (isQualified) {
     console.log(`Lead qualified — processing HubSpot update`);
     try {
-      const electricians = await findMatchingElectricians(
-        qualifiedData.location,
-        qualifiedData.jobType
-      );
-
-      console.log(electricians.length > 0
-        ? `Matched ${electricians.length} electrician(s) — notifying all`
-        : `No electricians matched — using default booking link`
-      );
-
-      const bookingLink = electricians[0]?.properties?.calendly_link || BOOKING_LINK;
-
       const contactId = await findHubSpotContact(leadName, leadPhone);
       if (contactId) {
-        const firstElecName = electricians[0]?.properties?.electrician_name || null;
-        await logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, firstElecName);
+        await logHubSpotNote(contactId, leadName, qualifiedData, transcript, bookingLink, electricianName);
         await updateDealStage(contactId, leadName);
       } else {
         console.warn(`No HubSpot contact found for ${leadName}`);
       }
 
+      // SMS to customer with booking link
       await sendCustomerSMSNotification(leadName, leadPhone, qualifiedData, bookingLink);
-      await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricians);
 
-      for (const electrician of electricians) {
-        const elecName = electrician.properties.electrician_name;
-        const elecPhone = electrician.properties.electrician_phone;
-        const elecLink = electrician.properties.calendly_link || BOOKING_LINK;
+      // SMS to you with full details
+      await sendSMSNotification(leadName, qualifiedData, contactId, bookingLink, electricianName ? [{ properties: { electrician_name: electricianName } }] : []);
 
-        if (elecPhone) {
-          await sendElectricianSMSNotification(
-            elecName,
-            elecPhone,
-            leadName,
-            leadPhone,
-            qualifiedData,
-            elecLink,
-            electricians.length > 1
-          );
-        }
+      // SMS directly to the electrician from the ad
+      if (electricianPhone) {
+        await sendElectricianSMSNotification(
+          electricianName,
+          electricianPhone,
+          leadName,
+          leadPhone,
+          qualifiedData,
+          bookingLink,
+          false
+        );
+        console.log(`Lead sent directly to electrician: ${electricianName}`);
+      } else {
+        console.log("No electrician linked to this ad — lead sent to owner only");
       }
 
       console.log("All post-call actions completed successfully");
@@ -761,12 +748,10 @@ async function handleCallEnded(session) {
           { jobType: "Callback requested", location: "TBC", timing: callbackTime },
           transcript,
           null,
-          null
+          electricianName
         );
-      } else {
-        console.warn(`No HubSpot contact found for ${leadName}`);
       }
-      scheduleCallback(leadName, leadPhone, callbackTime);
+      scheduleCallback(leadName, leadPhone, callbackTime, electricianName, electricianPhone, electricianCalendly);
       await sendCallbackSMSNotification(leadName, callbackTime);
       console.log("Callback scheduled and logged successfully");
     } catch (err) {
@@ -1056,8 +1041,8 @@ async function sendSMSNotification(leadName, qualifiedData, contactId, bookingLi
     }
 
     const electricianLine = electricians.length > 0
-      ? `Electricians Notified: ${electricians.map(e => e.properties.electrician_name).join(", ")}`
-      : `Electricians: None matched — follow up manually`;
+      ? `Electrician Notified: ${electricians.map(e => e.properties.electrician_name).join(", ")}`
+      : `Electrician: None linked to this ad — follow up manually`;
 
     const message = `🔌 ElectraBoostAI - New Qualified Lead!\n\nName: ${leadName}\nJob: ${qualifiedData.jobType}\nLocation: ${qualifiedData.location}\nTiming: ${qualifiedData.timing}\n${electricianLine}\n\n📊 Ad Tracking:\nCampaign: ${campaignName}\nAd: ${adName}\n\nBooking link sent to customer:\n${bookingLink}\n\nLog into HubSpot to follow up.`;
 
@@ -1121,14 +1106,14 @@ async function sendElectricianSMSNotification(electricianName, electricianPhone,
   }
 }
 
-async function sendNoAnswerCustomerSMS(leadName, leadPhone) {
+async function sendNoAnswerCustomerSMS(leadName, leadPhone, bookingLink) {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_NUMBER;
 
     const firstName = leadName.split(" ")[0];
-    const message = `Hi ${firstName}, this is James from ${BUSINESS_NAME}. We tried calling you a few times about your electrician enquiry but couldn't get through.\n\nWhenever you're ready, you can book a convenient time here:\n${BOOKING_LINK}\n\nOr simply reply to this message and we'll get back to you. 🔌`;
+    const message = `Hi ${firstName}, this is James from ${BUSINESS_NAME}. We tried calling you a few times about your electrician enquiry but couldn't get through.\n\nWhenever you're ready, you can book a convenient time here:\n${bookingLink}\n\nOr simply reply to this message and we'll get back to you. 🔌`;
 
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
